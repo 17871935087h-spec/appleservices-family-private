@@ -68,6 +68,22 @@ type maintainedLogin interface {
 	SubmitCode(appleservices.TwoFactorMethod, string) error
 }
 
+type acceptedSessionLoader interface {
+	LoadAcceptedICloud() (appleservices.RestoredICloudSession, error)
+}
+
+// Background maintenance must never start a fresh password authentication:
+// Apple may issue a verification challenge even without an explicit SMS call.
+// If the accepted checkpoint is unavailable, keep the existing connection and
+// let the user reconnect rather than falling back to a new login.
+func beginSavedRenewal(store acceptedSessionLoader, resume func(appleservices.RestoredICloudSession) (maintainedLogin, error)) (maintainedLogin, error) {
+	accepted, err := store.LoadAcceptedICloud()
+	if err != nil {
+		return nil, err
+	}
+	return resume(accepted)
+}
+
 // A renewal is adopted only after authentication, registration and device-list
 // access all succeed. Callers keep the old session on a transient error.
 func renewSession(begin func() (maintainedLogin, error), accountID string, registration appleservices.DeviceRegistration) (maintainedLogin, []appleservices.AccountDevice, error) {

@@ -44,6 +44,41 @@ func (s *fakeMaintainedLogin) RequestCode(method appleservices.TwoFactorMethod) 
 	return nil
 }
 
+type fakeAcceptedSessionLoader struct {
+	accepted appleservices.RestoredICloudSession
+	err      error
+}
+
+func (f fakeAcceptedSessionLoader) LoadAcceptedICloud() (appleservices.RestoredICloudSession, error) {
+	return f.accepted, f.err
+}
+
+func TestBackgroundRenewalUsesOnlySavedSession(t *testing.T) {
+	want := &fakeMaintainedLogin{account: "same"}
+	called := 0
+	resume := func(accepted appleservices.RestoredICloudSession) (maintainedLogin, error) {
+		called++
+		if accepted.ADSID != "same" {
+			t.Fatal("saved account binding not passed to restore")
+		}
+		return want, nil
+	}
+	got, devices, err := renewSessionMode(func() (maintainedLogin, error) {
+		return beginSavedRenewal(fakeAcceptedSessionLoader{accepted: appleservices.RestoredICloudSession{ADSID: "same"}}, resume)
+	}, "same", appleservices.DeviceRegistration{}, false)
+	if err != nil || got != want || len(devices) != 1 || called != 1 || want.registered != 0 || want.saved != 1 {
+		t.Fatalf("saved-session renewal failed: err=%v calls=%d registration=%d saves=%d", err, called, want.registered, want.saved)
+	}
+	called = 0
+	checkpointErr := errors.New("checkpoint missing")
+	got, _, err = renewSessionMode(func() (maintainedLogin, error) {
+		return beginSavedRenewal(fakeAcceptedSessionLoader{err: checkpointErr}, resume)
+	}, "same", appleservices.DeviceRegistration{}, false)
+	if got != nil || !errors.Is(err, checkpointErr) || called != 0 {
+		t.Fatal("missing checkpoint must stop renewal without a fresh login")
+	}
+}
+
 func TestRenewalRequiresFullSameAccountAuthentication(t *testing.T) {
 	for _, test := range []struct {
 		name      string
