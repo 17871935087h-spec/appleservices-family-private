@@ -263,6 +263,16 @@ func canonicalFamilyMemberDSID(value any) string {
 	return dsid
 }
 
+// The family roster identifies members by the numeric iCloud DSID. The GSA
+// checkpoint's ADSID is a separate identifier and must not be used here.
+func organizerFamilyMemberDSID(accepted acceptedCheckpoint) (string, error) {
+	dsid := canonicalFamilyMemberDSID(accepted.Session.DSID)
+	if dsid == "" {
+		return "", errors.New("organizer iCloud DSID unavailable")
+	}
+	return dsid, nil
+}
+
 func familyMemberReferenceDigest(key []byte, dsid string) ([]byte, error) {
 	if len(key) != 32 || canonicalFamilyMemberDSID(dsid) != dsid {
 		return nil, errors.New("family member reference inputs are invalid")
@@ -1286,6 +1296,13 @@ func run() error {
 	if err != nil || json.Unmarshal(data, &accepted) != nil || !strings.EqualFold(saved.AppleID, accepted.Session.AppleID) || accepted.ADSID != saved.DSID || accepted.Session.DSID == "" || accepted.Session.Tokens["mmeAuthToken"] == "" {
 		return errors.New("accepted iCloud checkpoint unavailable")
 	}
+	var organizerDSID string
+	if referenceMode {
+		organizerDSID, err = organizerFamilyMemberDSID(accepted)
+		if err != nil {
+			return err
+		}
+	}
 	icloudToken, familyToken := auth.Tokens["com.apple.gs.icloud.auth"], auth.Tokens["com.apple.gs.icloud.family.auth"]
 	if icloudToken == "" || familyToken == "" {
 		return errors.New("family GrandSlam tokens unavailable")
@@ -1827,7 +1844,7 @@ func run() error {
 		if !ok {
 			return errors.New("current organizer family roster is unavailable")
 		}
-		projection, _, projectErr := projectFamilyReferenceRoster(members, saved.DSID, referenceInputs.Key)
+		projection, _, projectErr := projectFamilyReferenceRoster(members, organizerDSID, referenceInputs.Key)
 		if projectErr != nil {
 			return projectErr
 		}
@@ -1846,7 +1863,7 @@ func run() error {
 		if !ok {
 			return errors.New("current organizer family roster is unavailable")
 		}
-		if _, resolveErr := resolveFamilyMemberReference(members, saved.DSID, referenceInputs.Key, referenceInputs.MemberRef); resolveErr != nil {
+		if _, resolveErr := resolveFamilyMemberReference(members, organizerDSID, referenceInputs.Key, referenceInputs.MemberRef); resolveErr != nil {
 			return resolveErr
 		}
 		removeURL, removeErr := appleEndpoint(familyMemberRemovalURL)
@@ -1891,7 +1908,7 @@ func run() error {
 			}
 			return verifiedMembers, nil
 		}
-		verifiedMembers, removalErr := removeFamilyMemberReference(members, saved.DSID, referenceInputs.Key, referenceInputs.MemberRef, removeOnce, readback, func() {
+		verifiedMembers, removalErr := removeFamilyMemberReference(members, organizerDSID, referenceInputs.Key, referenceInputs.MemberRef, removeOnce, readback, func() {
 			time.Sleep(400 * time.Millisecond)
 		})
 		if removalErr != nil {

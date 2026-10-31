@@ -17,8 +17,30 @@ import (
 	"strings"
 	"testing"
 
+	appleservices "github.com/Laky-64/appleservices"
 	"howett.net/plist"
 )
+
+func TestOrganizerFamilyReferenceUsesNumericICloudDSIDInsteadOfADSID(t *testing.T) {
+	accepted := acceptedCheckpoint{ADSID: "synthetic-alternate-id", Session: appleservices.Session{DSID: "100"}}
+	organizerDSID, err := organizerFamilyMemberDSID(accepted)
+	if err != nil || organizerDSID != "100" {
+		t.Fatalf("organizer family DSID = %q, err = %v", organizerDSID, err)
+	}
+	key := bytes.Repeat([]byte{1}, 32)
+	members := []any{
+		map[string]any{"appleId": "owner@example.test", "member-dsid": "100", "member-is-organizer": true, "member-is-child-account": false, "is-me": true},
+		map[string]any{"appleId": "member@example.test", "member-dsid": "200", "member-is-organizer": false, "member-is-child-account": false, "is-me": false},
+	}
+	roster, _, err := projectFamilyReferenceRoster(members, organizerDSID, key)
+	if err != nil || len(roster.Members) != 1 {
+		t.Fatalf("organizer roster rejected numeric iCloud DSID: %v", err)
+	}
+	accepted.Session.DSID = "synthetic-not-numeric"
+	if _, err := organizerFamilyMemberDSID(accepted); err == nil {
+		t.Fatal("nonnumeric iCloud DSID must not be treated as a family member DSID")
+	}
+}
 
 func TestSafeFamilyUIFormsOmitsValuesAndResolvesAppleAction(t *testing.T) {
 	origin, _ := url.Parse("https://setup.icloud.com/setup/mac/family/setupFamilyUI")
