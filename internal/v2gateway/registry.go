@@ -11,6 +11,11 @@ import (
 	"strings"
 )
 
+var (
+	errAccountListInvalid   = errors.New("account registry is invalid")
+	errAccountListAmbiguous = errors.New("account registry is ambiguous")
+)
+
 func loadRegistry(path string) (accountRegistry, error) {
 	var result accountRegistry
 	cleanPath := filepath.Clean(path)
@@ -50,6 +55,34 @@ func loadRegistry(path string) (accountRegistry, error) {
 		}
 	}
 	return result, nil
+}
+
+func accountListFromRegistry(registry accountRegistry) ([]accountListEntry, error) {
+	if len(registry.Accounts) > 500 {
+		return nil, errAccountListInvalid
+	}
+	accounts := make([]accountListEntry, 0, len(registry.Accounts))
+	seenIDs := make(map[string]struct{}, len(registry.Accounts))
+	seenAppleIDs := make(map[string]struct{}, len(registry.Accounts))
+	for _, account := range registry.Accounts {
+		if !validAccountID(account.ID) {
+			return nil, errAccountListInvalid
+		}
+		if _, exists := seenIDs[account.ID]; exists {
+			return nil, errAccountListAmbiguous
+		}
+		appleID, valid := normalizeAppleID(account.AppleID)
+		if !valid {
+			return nil, errAccountListInvalid
+		}
+		if _, exists := seenAppleIDs[appleID]; exists {
+			return nil, errAccountListAmbiguous
+		}
+		seenIDs[account.ID] = struct{}{}
+		seenAppleIDs[appleID] = struct{}{}
+		accounts = append(accounts, accountListEntry{AccountID: account.ID, AppleID: appleID})
+	}
+	return accounts, nil
 }
 
 func validateIntentDirectory(path string) (string, error) {

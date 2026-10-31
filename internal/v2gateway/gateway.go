@@ -188,6 +188,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, requestLimit)
 	switch r.URL.Path {
+	case "/v1/accounts/list":
+		g.handleAccountsList(w, r)
 	case "/v1/resolve":
 		g.handleResolve(w, r)
 	case "/v1/family/read":
@@ -236,6 +238,28 @@ func decodeRequest(w http.ResponseWriter, r *http.Request, target any) bool {
 		return false
 	}
 	return true
+}
+
+func (g *Gateway) handleAccountsList(w http.ResponseWriter, r *http.Request) {
+	var body accountListRequest
+	if !decodeRequest(w, r, &body) {
+		return
+	}
+	registry, err := loadRegistry(g.config.RegistryPath)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorReply{OK: false, Stage: "account-list-unavailable", Message: safeServiceFailure})
+		return
+	}
+	accounts, err := accountListFromRegistry(registry)
+	if err != nil {
+		if errors.Is(err, errAccountListAmbiguous) {
+			writeJSON(w, http.StatusConflict, errorReply{OK: false, Stage: "account-list-ambiguous", Message: safeAccountAmbiguous})
+			return
+		}
+		writeJSON(w, http.StatusServiceUnavailable, errorReply{OK: false, Stage: "account-list-unavailable", Message: safeServiceFailure})
+		return
+	}
+	writeJSON(w, http.StatusOK, accountListReply{OK: true, Accounts: accounts})
 }
 
 func (g *Gateway) handleResolve(w http.ResponseWriter, r *http.Request) {

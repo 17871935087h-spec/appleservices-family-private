@@ -162,6 +162,18 @@ type accountRegistry struct {
 	Accounts []accountEntry `json:"accounts"`
 }
 
+type accountListRequest struct{}
+
+type accountListEntry struct {
+	AccountID string `json:"account_id"`
+	AppleID   string `json:"apple_id"`
+}
+
+type accountListReply struct {
+	OK       bool               `json:"ok"`
+	Accounts []accountListEntry `json:"accounts"`
+}
+
 func defaultRequestTimeout(value time.Duration) time.Duration {
 	if value <= 0 {
 		return 125 * time.Second

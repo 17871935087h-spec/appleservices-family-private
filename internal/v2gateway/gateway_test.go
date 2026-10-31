@@ -1147,6 +1147,148 @@ func TestGatewayRejectsCookieOriginAndOversizedInput(t *testing.T) {
 	}
 }
 
+func TestAccountsListReturnsOnlyAccountIDsAndNormalizedAppleIDs(t *testing.T) {
+	registry := accountRegistry{Accounts: []accountEntry{
+		{ID: "account-a", Name: "private-name", AppleID: " First@Example.invalid ", Dir: `D:\private\account-a`},
+		{ID: "account-b", Name: "private-name-b", AppleID: "second@example.invalid", Dir: `D:\private\account-b`},
+	}}
+	data, err := json.Marshal(registry)
+	if err != nil {
+		t.Fatal("could not encode synthetic registry")
+	}
+	fake := newFakeDashboard(t, func(http.ResponseWriter, *http.Request, dashboardActionCall) {
+		t.Error("account listing must not call the dashboard")
+	})
+	gateway := testGateway(t, fake, testRegistry(t, string(data)), "", time.Second)
+	response := gatewayRequest(t, gateway, "/v1/accounts/list", `{}`)
+	if response.Code != http.StatusOK {
+		t.Fatal("account listing did not succeed")
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal("account listing response was not JSON")
+	}
+	if len(envelope) != 2 || string(envelope["ok"]) != "true" {
+		t.Fatal("account listing response contained unexpected top-level fields")
+	}
+	var listed []map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["accounts"], &listed); err != nil || len(listed) != 2 {
+		t.Fatal("account listing returned an incomplete account array")
+	}
+	wantIDs := []string{"account-a", "account-b"}
+	wantAppleIDs := []string{"first@example.invalid", "second@example.invalid"}
+	for i, account := range listed {
+		if len(account) != 2 {
+			t.Fatalf("account %d contained fields beyond the public projection", i)
+		}
+		var accountID, appleID string
+		if json.Unmarshal(account["account_id"], &accountID) != nil || json.Unmarshal(account["apple_id"], &appleID) != nil {
+			t.Fatalf("account %d omitted required public fields", i)
+		}
+		if accountID != wantIDs[i] || appleID != wantAppleIDs[i] {
+			t.Fatalf("account %d did not match the normalized public projection", i)
+		}
+	}
+}
+
+func TestAccountsListRejectsDuplicateIDsAndAppleIDsWithoutPartialData(t *testing.T) {
+	cases := []struct {
+		name     string
+		accounts []accountEntry
+	}{
+		{
+			name: "duplicate account IDs",
+			accounts: []accountEntry{
+				{ID: "duplicate", AppleID: "first@example.invalid"},
+				{ID: "duplicate", AppleID: "second@example.invalid"},
+			},
+		},
+		{
+			name: "duplicate normalized Apple IDs",
+			accounts: []accountEntry{
+				{ID: "account-a", AppleID: "First@Example.invalid"},
+				{ID: "account-b", AppleID: " first@example.invalid "},
+			},
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			data, err := json.Marshal(accountRegistry{Accounts: test.accounts})
+			if err != nil {
+				t.Fatal("could not encode synthetic registry")
+			}
+			fake := newFakeDashboard(t, func(http.ResponseWriter, *http.Request, dashboardActionCall) {
+				t.Error("account listing must not call the dashboard")
+			})
+			gateway := testGateway(t, fake, testRegistry(t, string(data)), "", time.Second)
+			response := gatewayRequest(t, gateway, "/v1/accounts/list", `{}`)
+			if response.Code == http.StatusOK {
+				t.Fatal("ambiguous registry was accepted")
+			}
+			var reply map[string]json.RawMessage
+			if json.Unmarshal(response.Body.Bytes(), &reply) != nil {
+				t.Fatal("ambiguous registry response was not JSON")
+			}
+			if _, exists := reply["accounts"]; exists {
+				t.Fatal("failed account listing returned a partial account array")
+			}
+			if bytes.Contains(response.Body.Bytes(), []byte("example.invalid")) {
+				t.Fatal("failed account listing exposed registry identity data")
+			}
+		})
+	}
+}
+
+func TestAccountsListUsesBearerPostNoOriginNoCookieJSONContract(t *testing.T) {
+	registry := testRegistry(t, `{"accounts":[]}`)
+	fake := newFakeDashboard(t, func(http.ResponseWriter, *http.Request, dashboardActionCall) {
+		t.Error("account listing must not call the dashboard")
+	})
+	gateway := testGateway(t, fake, registry, "", time.Second)
+	cases := []struct {
+		name       string
+		method     string
+		authorized bool
+		origin     string
+		cookie     string
+		body       string
+		status     int
+	}{
+		{name: "missing bearer", method: http.MethodPost, body: `{}`, status: http.StatusUnauthorized},
+		{name: "GET rejected", method: http.MethodGet, authorized: true, body: `{}`, status: http.StatusMethodNotAllowed},
+		{name: "Origin rejected", method: http.MethodPost, authorized: true, origin: "https://untrusted.invalid", body: `{}`, status: http.StatusForbidden},
+		{name: "cookie rejected", method: http.MethodPost, authorized: true, cookie: "session=private", body: `{}`, status: http.StatusForbidden},
+		{name: "unknown JSON field rejected", method: http.MethodPost, authorized: true, body: `{"unexpected":true}`, status: http.StatusBadRequest},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, "/v1/accounts/list", strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			if test.authorized {
+				request.Header.Set("Authorization", "Bearer "+testBearer)
+			}
+			if test.origin != "" {
+				request.Header.Set("Origin", test.origin)
+			}
+			if test.cookie != "" {
+				request.Header.Set("Cookie", test.cookie)
+			}
+			response := httptest.NewRecorder()
+			gateway.ServeHTTP(response, request)
+			if response.Code != test.status {
+				t.Fatalf("request was not rejected with the expected status (%d)", test.status)
+			}
+			var reply map[string]json.RawMessage
+			if json.Unmarshal(response.Body.Bytes(), &reply) != nil {
+				t.Fatal("rejected request response was not JSON")
+			}
+			if _, exists := reply["accounts"]; exists {
+				t.Fatal("rejected request returned account data")
+			}
+		})
+	}
+}
+
 func TestBearerComparisonAndConfigRequireLoopbackAndAbsolutePaths(t *testing.T) {
 	if _, err := validateConfig(Config{ListenAddr: "0.0.0.0:18742", DashboardURL: DefaultDashboard, RegistryPath: `D:\registry\accounts.json`, IntentDir: `D:\journal`, BearerToken: testBearer}); err == nil {
 		t.Fatal("non-loopback listener accepted")

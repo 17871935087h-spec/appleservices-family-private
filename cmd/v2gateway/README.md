@@ -2,6 +2,8 @@
 
 The gateway exposes only fixed `POST` endpoints on `127.0.0.1:18742`. It uses the dashboard's ephemeral `X-App-Token` internally and never exposes that token, credentials, cookies, family identifiers or dashboard error bodies to V2. The one-shot family-add endpoint can receive the target Apple ID and password from V2 for a user-requested operation; it does not persist or return the password. The gateway does not support account creation, SMS or an unknown-outcome reset endpoint.
 
+`POST /v1/accounts/list` accepts `{}` and returns only registered account IDs and normalized Apple IDs, for example `{"ok":true,"accounts":[{"account_id":"<id>","apple_id":"<apple-id>"}]}`. It reads the local registry only and does not contact Apple or the dashboard. Duplicate account IDs, duplicate Apple IDs, or an invalid registry fail the entire request; no partial account list is returned. The endpoint uses the same bearer, loopback, no-Origin, no-cookie and JSON request requirements as the other gateway routes.
+
 Configuration:
 
 - `V2GATEWAY_BEARER_TOKEN`: random secret of at least 32 bytes, supplied through the process environment. Do not put it on the command line or in a file.
