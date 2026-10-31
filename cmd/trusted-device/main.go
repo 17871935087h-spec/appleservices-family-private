@@ -27,6 +27,8 @@ import (
 	"github.com/Laky-64/appleservices/nativeadi"
 )
 
+const defaultTwoFactorMethod = "trusted-device"
+
 func main() {
 	if err := run(); err != nil {
 		// Apple's own wording decides whether a rejection means a throttled
@@ -49,7 +51,7 @@ func run() (runErr error) {
 	keyPath := flag.String("push-key", "", "matching client push private key PEM file")
 	codeProvider := flag.String("code-provider", "", "absolute path to a working local ADI code-provider executable")
 	server := flag.String("anisette", "https://ani.sidestore.io", "anisette server for this identity")
-	method := flag.String("twofactor", "sms", "initial sign-in method: sms, sms-existing, trusted-device or circle")
+	method := flag.String("twofactor", defaultTwoFactorMethod, "initial sign-in method: sms, sms-existing, trusted-device or circle (default: trusted-device)")
 	check := flag.Bool("check", false, "check local prerequisites without contacting Apple")
 	native := flag.Bool("native-push", false, "use the installed iCloud for Windows APS daemon")
 	probeNative := flag.Bool("probe-native-push", false, "check native token and local callback; no account registration")
@@ -61,9 +63,10 @@ func run() (runErr error) {
 	background := flag.Bool("background", false, "keep running with closed stdin; never approve requests or log generated codes")
 	refreshEvery := flag.Duration("refresh-every", 10*time.Minute, "refresh account authentication, registration and device status at this interval")
 	controlAPI := flag.Bool("control-api", false, "enable authenticated local dashboard control")
-	guiAuth := flag.Bool("gui-auth", false, "complete initial SMS verification through the dashboard")
+	guiAuth := flag.Bool("gui-auth", false, "complete initial two-factor verification through the dashboard")
 	resumeSession := flag.Bool("resume-session", false, "restore the account-bound GSA and accepted iCloud sessions without a password")
 	flag.Parse()
+	*method = normalizeTwoFactorMethod(*method)
 	if *background {
 		*controlAPI = true
 	}
@@ -86,7 +89,7 @@ func run() (runErr error) {
 		fmt.Println("Account trust and remote code delivery have not been verified.")
 		return nil
 	}
-	if *method != "sms" && *method != "sms-existing" && *method != "trusted-device" && *method != "circle" {
+	if !validTwoFactorMethod(*method) {
 		return errors.New("twofactor must be sms, sms-existing, trusted-device or circle")
 	}
 	if *listenFor < 0 {
@@ -311,6 +314,9 @@ func run() (runErr error) {
 		if err := completeCircleLogin(ctx, login, push.State().Token, events, errorsCh, panelCommands, &status, *dir); err != nil {
 			return err
 		}
+		if login.NeedsTwoFactor() {
+			return errors.New("Circle verification did not complete")
+		}
 	}
 	if login.NeedsTwoFactor() {
 		if *background && (!*guiAuth || panel == nil) {
@@ -318,11 +324,8 @@ func run() (runErr error) {
 			status.State = "verification_required"
 			return errVerificationRequired
 		}
-		factor := appleservices.SMS
-		if *method == "trusted-device" {
-			factor = appleservices.TrustedDevice
-		}
-		if *method != "sms-existing" {
+		factor, requestCode := initialTwoFactorPlan(*method)
+		if requestCode {
 			if err := login.RequestCode(factor); err != nil {
 				return err
 			}
@@ -1511,6 +1514,32 @@ func parseFamilyStatus(output string) (*control.FamilyInfo, error) {
 		return &status, nil
 	}
 	return nil, errors.New("redacted family status missing")
+}
+
+func normalizeTwoFactorMethod(method string) string {
+	if strings.TrimSpace(method) == "" {
+		return defaultTwoFactorMethod
+	}
+	return method
+}
+
+func validTwoFactorMethod(method string) bool {
+	return method == "sms" || method == "sms-existing" || method == "trusted-device" || method == "circle"
+}
+
+// initialTwoFactorPlan is used only after Apple returns a pending challenge.
+// Existing SMS challenges are submitted as-is, without requesting another code.
+func initialTwoFactorPlan(method string) (appleservices.TwoFactorMethod, bool) {
+	switch method {
+	case "sms":
+		return appleservices.SMS, true
+	case "sms-existing":
+		return appleservices.SMS, false
+	case "trusted-device":
+		return appleservices.TrustedDevice, true
+	default:
+		return appleservices.TrustedDevice, false
+	}
 }
 
 func codeRequest(device *appleservices.Device) aps.CodeRequest {

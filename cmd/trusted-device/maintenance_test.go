@@ -18,6 +18,7 @@ type fakeMaintainedLogin struct {
 	listErr                        error
 	saveErr                        error
 	registered, saved, clientCalls int
+	requestedCodes                 []appleservices.TwoFactorMethod
 }
 
 func (s *fakeMaintainedLogin) NeedsTwoFactor() bool { return s.challenge }
@@ -38,6 +39,10 @@ func (s *fakeMaintainedLogin) RespondToSignIn(string, bool) error {
 }
 func (s *fakeMaintainedLogin) BeginAccountValidation() error                          { return nil }
 func (s *fakeMaintainedLogin) SubmitCode(appleservices.TwoFactorMethod, string) error { return nil }
+func (s *fakeMaintainedLogin) RequestCode(method appleservices.TwoFactorMethod) error {
+	s.requestedCodes = append(s.requestedCodes, method)
+	return nil
+}
 
 func TestRenewalRequiresFullSameAccountAuthentication(t *testing.T) {
 	for _, test := range []struct {
@@ -64,8 +69,35 @@ func TestRenewalRequiresFullSameAccountAuthentication(t *testing.T) {
 			if !test.wantErr && (updated != &login || len(devices) != 1) {
 				t.Fatal("renewal results lost")
 			}
-			if login.challenge && (login.clientCalls != 0 || login.registered != 0) {
-				t.Fatal("background challenge continued without verification")
+			if login.challenge && (login.clientCalls != 0 || login.registered != 0 || len(login.requestedCodes) != 0) {
+				t.Fatal("background challenge continued or requested a verification code")
+			}
+		})
+	}
+}
+
+func TestTwoFactorDefaultsToTrustedDeviceAndPreservesExplicitSMSChoices(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		input           string
+		wantMethod      string
+		wantFactor      appleservices.TwoFactorMethod
+		wantRequestCode bool
+	}{
+		{name: "unspecified", input: "", wantMethod: "trusted-device", wantFactor: appleservices.TrustedDevice, wantRequestCode: true},
+		{name: "trusted-device", input: "trusted-device", wantMethod: "trusted-device", wantFactor: appleservices.TrustedDevice, wantRequestCode: true},
+		{name: "explicit-sms", input: "sms", wantMethod: "sms", wantFactor: appleservices.SMS, wantRequestCode: true},
+		{name: "existing-sms", input: "sms-existing", wantMethod: "sms-existing", wantFactor: appleservices.SMS, wantRequestCode: false},
+		{name: "circle-does-not-request-sms", input: "circle", wantMethod: "circle", wantFactor: appleservices.TrustedDevice, wantRequestCode: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			method := normalizeTwoFactorMethod(test.input)
+			if method != test.wantMethod || !validTwoFactorMethod(method) {
+				t.Fatalf("method = %q, want valid %q", method, test.wantMethod)
+			}
+			factor, requestCode := initialTwoFactorPlan(method)
+			if factor != test.wantFactor || requestCode != test.wantRequestCode {
+				t.Fatalf("plan = (%v, %v), want (%v, %v)", factor, requestCode, test.wantFactor, test.wantRequestCode)
 			}
 		})
 	}

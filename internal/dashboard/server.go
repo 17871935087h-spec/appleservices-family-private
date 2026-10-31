@@ -113,6 +113,15 @@ type credentials struct {
 	TwoFactor string `json:"twofactor,omitempty"`
 }
 
+const defaultDashboardTwoFactorMethod = "trusted-device"
+
+func normalizeDashboardTwoFactorMethod(method string) string {
+	if strings.TrimSpace(method) == "" {
+		return defaultDashboardTwoFactorMethod
+	}
+	return method
+}
+
 func New(config Config) (*Server, error) {
 	listener, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", intString(config.Port)))
 	if err != nil {
@@ -1021,9 +1030,7 @@ func (s *Server) startInMode(ctx context.Context, dir string, creds credentials,
 	if strings.TrimSpace(creds.AppleID) == "" || (!resume && creds.Password == "") {
 		return control.Result{Message: "请输入 Apple 账户和密码"}
 	}
-	if creds.TwoFactor == "" {
-		creds.TwoFactor = "sms"
-	}
+	creds.TwoFactor = normalizeDashboardTwoFactorMethod(creds.TwoFactor)
 	if creds.TwoFactor != "sms" && creds.TwoFactor != "sms-existing" && creds.TwoFactor != "circle" && creds.TwoFactor != "trusted-device" {
 		return control.Result{Message: "不支持的验证方式"}
 	}

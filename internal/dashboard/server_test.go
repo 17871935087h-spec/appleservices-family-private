@@ -50,6 +50,22 @@ func TestDashboardRejectsCrossOriginAndMissingCapability(t *testing.T) {
 	}
 }
 
+func TestDashboardTwoFactorDefaultsToTrustedDeviceAndPreservesExplicitSMSChoices(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		want  string
+	}{
+		{input: "", want: "trusted-device"},
+		{input: "trusted-device", want: "trusted-device"},
+		{input: "sms", want: "sms"},
+		{input: "sms-existing", want: "sms-existing"},
+	} {
+		if got := normalizeDashboardTwoFactorMethod(test.input); got != test.want {
+			t.Errorf("normalizeDashboardTwoFactorMethod(%q) = %q, want %q", test.input, got, test.want)
+		}
+	}
+}
+
 func TestFamilyAddReadinessRequiresLiveWorkerCapability(t *testing.T) {
 	dir := t.TempDir()
 	executable, err := os.Executable()

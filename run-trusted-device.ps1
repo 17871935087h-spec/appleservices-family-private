@@ -4,6 +4,8 @@ param(
     [string]$ADILibrary = (Join-Path $PSScriptRoot '.cache\openbubbles-store\rust_lib_bluebubbles.dll'),
     [string]$Python = 'python',
     [string]$RefreshEvery = '10m',
+    [ValidateSet('trusted-device', 'sms', 'sms-existing', 'circle')]
+    [string]$TwoFactor = 'trusted-device',
     [switch]$Check,
     [switch]$Background,
     [switch]$Status,
@@ -54,7 +56,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
 } finally { Pop-Location }
 
-$taskArgs = @('-native-adi', '-dir', $StateDir, '-adi-dll', $ADILibrary, '-python', $Python, '-twofactor', 'sms', '-refresh-every', $RefreshEvery)
+$taskArgs = @('-native-adi', '-dir', $StateDir, '-adi-dll', $ADILibrary, '-python', $Python, '-twofactor', $TwoFactor, '-refresh-every', $RefreshEvery)
 if ($Check) {
     & $taskExecutable @taskArgs -check
     if ($LASTEXITCODE -ne 0) { throw 'Local input check failed.' }
