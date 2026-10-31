@@ -40,13 +40,18 @@ var (
 // HMEWebSetupError describes a failed Web setup request without including its
 // authenticated URL, request body, cookies, or response body.
 type HMEWebSetupError struct {
-	HTTPStatus  int
-	FailureKind string
+	HTTPStatus   int
+	FailureKind  string
+	RedirectHost string
 }
 
 func (e *HMEWebSetupError) Error() string {
+	redirect := ""
+	if e.RedirectHost != "" {
+		redirect = ", redirect to " + e.RedirectHost
+	}
 	if e.HTTPStatus != 0 {
-		return fmt.Sprintf("Apple iCloud Web setup request failed (HTTP %d, %s)", e.HTTPStatus, e.FailureKind)
+		return fmt.Sprintf("Apple iCloud Web setup request failed (HTTP %d, %s%s)", e.HTTPStatus, e.FailureKind, redirect)
 	}
 	return fmt.Sprintf("Apple iCloud Web setup request failed (%s)", e.FailureKind)
 }
@@ -444,10 +449,16 @@ func (c *HideMyEmailClient) accountLogin(ctx context.Context, state *hmeAuthStat
 	if strings.EqualFold(state.accountCountry, "CHN") || strings.EqualFold(state.accountCountry, "CN") {
 		setupBase = "https://setup.icloud.com.cn/setup/ws/1"
 	}
+	c.setupBase = setupBase
 	loginBody, _ := json.Marshal(map[string]any{"dsWebAuthToken": state.sessionToken, "accountCountryCode": state.accountCountry, "extended_login": true, "trustToken": state.trustToken})
 	data, err := c.hmeSetupRequest(ctx, http.MethodPost, setupBase+"/accountLogin", loginBody)
 	if err != nil {
 		return fmt.Errorf("Apple iCloud Web session establishment failed: %w", err)
+	}
+	// A setup redirect may move the Web account to its regional endpoint.
+	// Terms reads and a separately authorized repair must use that same base.
+	if c.setupBase != "" {
+		setupBase = c.setupBase
 	}
 	var result hmeAccountLoginResult
 	if json.Unmarshal(data, &result) != nil || result.DSInfo.DSID == "" {
@@ -477,7 +488,45 @@ func (c *HideMyEmailClient) accountLogin(ctx context.Context, state *hmeAuthStat
 	return c.saveSession()
 }
 
+func hmeSetupHostAllowed(host string) bool {
+	host = strings.ToLower(host)
+	if host == "setup.icloud.com" || host == "setup.icloud.com.cn" {
+		return true
+	}
+	for _, suffix := range []string{"-setup.icloud.com", "-setup.icloud.com.cn"} {
+		if !strings.HasSuffix(host, suffix) {
+			continue
+		}
+		shard := strings.TrimSuffix(host, suffix)
+		if len(shard) < 2 || len(shard) > 4 || shard[0] != 'p' {
+			continue
+		}
+		digits := true
+		for _, value := range shard[1:] {
+			if value < '0' || value > '9' {
+				digits = false
+			}
+		}
+		if digits {
+			return true
+		}
+	}
+	return false
+}
+
+func hmeSetupRedirectTarget(current *url.URL, location string) (*url.URL, error) {
+	next, err := current.Parse(location)
+	if err != nil || location == "" || next.Scheme != "https" || next.User != nil || next.Fragment != "" || next.Opaque != "" || (next.Port() != "" && next.Port() != "443") || !hmeSetupHostAllowed(next.Hostname()) || current.EscapedPath() != "/setup/ws/1/accountLogin" || next.EscapedPath() != current.EscapedPath() {
+		return nil, errors.New("unrecognized setup redirect")
+	}
+	return next, nil
+}
+
 func (c *HideMyEmailClient) hmeSetupRequest(ctx context.Context, method, endpoint string, body []byte) ([]byte, error) {
+	return c.hmeSetupRequestAt(ctx, method, endpoint, body, 0)
+}
+
+func (c *HideMyEmailClient) hmeSetupRequestAt(ctx context.Context, method, endpoint string, body []byte, redirects int) ([]byte, error) {
 	request, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, &HMEWebSetupError{FailureKind: "invalid-request"}
@@ -487,7 +536,11 @@ func (c *HideMyEmailClient) hmeSetupRequest(ctx context.Context, method, endpoin
 	request.Header.Set("Origin", "https://www.icloud.com")
 	request.Header.Set("Referer", "https://www.icloud.com/")
 	request.Header.Set("User-Agent", hmeWebUserAgent)
-	response, err := c.http.Do(request)
+	// Do not let net/http rewrite POST into GET on a 302 or forward an
+	// authenticated request to an unchecked Location.
+	httpClient := *c.http
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := httpClient.Do(request)
 	if err != nil {
 		kind := "network"
 		var timeout interface{ Timeout() bool }
@@ -500,11 +553,35 @@ func (c *HideMyEmailClient) hmeSetupRequest(ctx context.Context, method, endpoin
 	}
 	defer response.Body.Close()
 	data, readErr := io.ReadAll(io.LimitReader(response.Body, (4<<20)+1))
+	if response.StatusCode == http.StatusMovedPermanently || response.StatusCode == http.StatusFound || response.StatusCode == http.StatusTemporaryRedirect || response.StatusCode == http.StatusPermanentRedirect {
+		next, redirectErr := hmeSetupRedirectTarget(request.URL, response.Header.Get("Location"))
+		if redirectErr != nil {
+			redirectHost := ""
+			if target, parseErr := response.Location(); parseErr == nil {
+				host := strings.ToLower(target.Hostname())
+				if hmeSetupHostAllowed(host) || host == "www.icloud.com" || host == "www.icloud.com.cn" || host == "idmsa.apple.com" {
+					redirectHost = host
+				}
+			}
+			return nil, &HMEWebSetupError{HTTPStatus: response.StatusCode, FailureKind: "unrecognized-redirect", RedirectHost: redirectHost}
+		}
+		if redirects >= 2 || next.String() == request.URL.String() {
+			return nil, &HMEWebSetupError{HTTPStatus: response.StatusCode, FailureKind: "redirect-limit", RedirectHost: next.Hostname()}
+		}
+		if readErr != nil || len(data) > 4<<20 {
+			return nil, &HMEWebSetupError{HTTPStatus: response.StatusCode, FailureKind: "invalid-response"}
+		}
+		response.Body.Close()
+		return c.hmeSetupRequestAt(ctx, method, next.String(), body, redirects+1)
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, &HMEWebSetupError{HTTPStatus: response.StatusCode, FailureKind: "http"}
 	}
 	if readErr != nil || len(data) > 4<<20 {
 		return nil, &HMEWebSetupError{HTTPStatus: response.StatusCode, FailureKind: "invalid-response"}
+	}
+	if redirects > 0 {
+		c.setupBase = request.URL.Scheme + "://" + request.URL.Host + "/setup/ws/1"
 	}
 	return data, nil
 }

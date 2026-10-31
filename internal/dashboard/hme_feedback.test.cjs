@@ -8,6 +8,7 @@ const vm = require('node:vm');
 
 const appPath = path.join(__dirname, 'web', 'app.js');
 const appSource = fs.readFileSync(appPath, 'utf8');
+const indexSource = fs.readFileSync(path.join(__dirname, 'web', 'index.html'), 'utf8');
 const eventMarker = "$('reloadView').addEventListener";
 const eventOffset = appSource.indexOf(eventMarker);
 if (eventOffset < 0) throw new Error('Could not find dashboard event binding boundary');
@@ -131,21 +132,28 @@ test('failed generation keeps safe message after the global toast expires and of
   assert.equal(harness.elements.get('notice').hidden, true);
   assert.match(status.textContent, /fixture safe message/);
 
+  harness.context.__hmeTest.resetHME();
+  assert.equal(status.hidden, true);
+  assert.equal(harness.elements.get('hmeActionFeedback').hidden, true);
+  assert.equal(harness.elements.get('hmeReconnectButton').hidden, false);
   harness.elements.get('hmeReconnectButton').dispatch('click');
   assert.equal(harness.state().loginMode, 'reconnect');
   assert.equal(harness.state().loginAccount, 'fixture-account');
   assert.equal(harness.elements.get('loginDialog').modalShown, true);
-
-  harness.context.__hmeTest.resetHME();
-  assert.equal(status.hidden, true);
-  assert.equal(harness.elements.get('hmeReconnectButton').hidden, true);
 });
 
-test('reconnect button is shown only for reconnect-related HME stages', async () => {
+test('reconnect button stays visible in the HME title for every action state', async () => {
+  const sectionStart = indexSource.indexOf('id="hmeCard"');
+  const sectionEnd = indexSource.indexOf('</section>', sectionStart);
+  const hmeSection = indexSource.slice(sectionStart, sectionEnd);
+  assert.match(hmeSection, /<div class="commerce-actions"><button id="hmeReconnectButton" class="text-button" type="button">重新连接当前账号<\/button>/);
+  assert.doesNotMatch(hmeSection.match(/<button id="hmeReconnectButton"[^>]*>/)?.[0] || '', /\shidden(?:[ =>])/);
+  assert.match(appSource, /\$\('hmeReconnectButton'\)\.disabled=busy/);
+
   for (const stage of ['reconnect-required', 'other-stage']) {
     const harness = createHarness(async () => jsonResponse({ ok: false, message: 'fixture error', stage }));
     await harness.action('hme-generate');
-    assert.equal(harness.elements.get('hmeReconnectButton').hidden, stage !== 'reconnect-required');
+    assert.equal(harness.elements.get('hmeReconnectButton').hidden, false);
   }
 });
 
@@ -158,7 +166,7 @@ test('successful generation displays the candidate and replaces prior feedback',
   assert.equal(harness.elements.get('hmeActionFeedback').hidden, false);
   assert.equal(harness.elements.get('hmeCandidatePanel').hidden, false);
   assert.equal(harness.elements.get('hmeCandidateAddress').textContent, 'candidate@example.invalid');
-  assert.equal(harness.elements.get('hmeReconnectButton').hidden, true);
+  assert.equal(harness.elements.get('hmeReconnectButton').hidden, false);
 });
 
 test('successful response without a candidate is reported as an error', async () => {
@@ -168,7 +176,7 @@ test('successful response without a candidate is reported as an error', async ()
   assert.match(harness.elements.get('hmeActionStatus').textContent, /未返回候选地址/);
   assert.equal(harness.elements.get('hmeActionStatus').dataset.state, 'error');
   assert.equal(harness.elements.get('hmeCandidatePanel').hidden, true);
-  assert.equal(harness.elements.get('hmeReconnectButton').hidden, true);
+  assert.equal(harness.elements.get('hmeReconnectButton').hidden, false);
 });
 
 test('late response from a previously selected account cannot replace the new account status', async () => {
@@ -180,7 +188,7 @@ test('late response from a previously selected account cannot replace the new ac
   await request;
 
   assert.equal(harness.elements.get('hmeActionStatus').hidden, true);
-  assert.equal(harness.elements.get('hmeReconnectButton').hidden, true);
+  assert.equal(harness.elements.get('hmeReconnectButton').hidden, false);
   assert.equal(harness.elements.get('notice').hidden, true);
   assert.equal(harness.state().busy, false);
 });
