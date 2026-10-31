@@ -735,16 +735,23 @@ func TestPostFamilyMemberRemovalEmitsOnlyHTTPStatusForDiagnostics(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	previousStdout, previousFlag := os.Stdout, familyRemovalOutcomeEnabled
-	os.Stdout, familyRemovalOutcomeEnabled = writer, true
-	t.Cleanup(func() { os.Stdout, familyRemovalOutcomeEnabled = previousStdout, previousFlag })
+	previousStdout, previousFlag, previousDir := os.Stdout, familyRemovalOutcomeEnabled, familyRemovalDiagnosticDir
+	diagnosticDir := t.TempDir()
+	os.Stdout, familyRemovalOutcomeEnabled, familyRemovalDiagnosticDir = writer, true, diagnosticDir
+	t.Cleanup(func() {
+		os.Stdout, familyRemovalOutcomeEnabled, familyRemovalDiagnosticDir = previousStdout, previousFlag, previousDir
+	})
 	submitted, _, postErr := postFamilyMemberRemoval(server.Client(), request, nil)
 	_ = writer.Close()
-	os.Stdout, familyRemovalOutcomeEnabled = previousStdout, previousFlag
+	os.Stdout, familyRemovalOutcomeEnabled, familyRemovalDiagnosticDir = previousStdout, previousFlag, previousDir
 	output, readErr := io.ReadAll(reader)
 	_ = reader.Close()
 	if !submitted || postErr == nil || readErr != nil || string(output) != "FAMILY_REMOVE_HTTP_STATUS=401\n" {
 		t.Fatalf("unexpected safe diagnostic: submitted=%t postErr=%v readErr=%v output=%q", submitted, postErr, readErr, output)
+	}
+	logData, err := os.ReadFile(filepath.Join(diagnosticDir, ".family-remove-http-status.log"))
+	if err != nil || !strings.HasSuffix(string(logData), " http=401\n") || strings.Contains(string(logData), "synthetic-private") {
+		t.Fatalf("diagnostic file missing or contained unexpected data: %q, err=%v", logData, err)
 	}
 }
 

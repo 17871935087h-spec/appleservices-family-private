@@ -65,6 +65,35 @@ const familyMemberRefDomain = "appleservices-family-member-ref-v1\x00"
 var suppressSensitiveFamilyErrors bool
 var familyRemovalOutcomeEnabled bool
 var familyRemovalOutcome string
+var familyRemovalDiagnosticDir string
+
+// Record only the HTTP status (or a transport failure) for an attempted
+// removal. The response body, account identifiers and credentials are never
+// included; failure to record must not change the operation outcome.
+func recordFamilyRemovalDiagnostic(status int) {
+	if !familyRemovalOutcomeEnabled {
+		return
+	}
+	value := "transport_error"
+	if status >= 100 && status <= 599 {
+		value = strconv.Itoa(status)
+		fmt.Printf("FAMILY_REMOVE_HTTP_STATUS=%s\n", value)
+	}
+	if familyRemovalDiagnosticDir == "" {
+		return
+	}
+	path := filepath.Join(familyRemovalDiagnosticDir, ".family-remove-http-status.log")
+	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
+		return
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+	if err == nil {
+		_, _ = fmt.Fprintf(file, "%s http=%s\n", time.Now().UTC().Format(time.RFC3339), value)
+		_ = file.Close()
+	}
+}
 
 type familyRosterMemberRef struct {
 	Ref   string `json:"ref"`
@@ -664,11 +693,10 @@ func postFamilyMemberRemoval(client *http.Client, request *http.Request, beforeS
 		defer response.Body.Close()
 	}
 	if err != nil {
+		recordFamilyRemovalDiagnostic(0)
 		return true, false, errors.New("family member removal transport outcome is unknown")
 	}
-	if familyRemovalOutcomeEnabled && response.StatusCode >= 100 && response.StatusCode <= 599 {
-		fmt.Printf("FAMILY_REMOVE_HTTP_STATUS=%d\n", response.StatusCode)
-	}
+	recordFamilyRemovalDiagnostic(response.StatusCode)
 	data, readErr := io.ReadAll(io.LimitReader(response.Body, (2<<20)+1))
 	if readErr != nil || len(data) > 2<<20 {
 		return true, false, errors.New("family member removal response is invalid")
@@ -1247,6 +1275,12 @@ func run() error {
 	}
 	if *dir == "" {
 		return errors.New("bound account directory is required")
+	}
+	if *removeMemberRef {
+		resolved, resolveErr := filepath.EvalSymlinks(*dir)
+		if resolveErr == nil && filepath.IsAbs(resolved) && (runtime.GOOS != "windows" || strings.EqualFold(filepath.VolumeName(resolved), "D:")) {
+			familyRemovalDiagnosticDir = resolved
+		}
 	}
 	if *setupUIDump != "" && !*inspectSetupUI {
 		return errors.New("setup UI dump requires setup UI inspection")
