@@ -649,26 +649,17 @@ func TestRemoveFamilyMemberReferenceRejectsPreSubmitAndAmbiguousReadback(t *test
 	}
 }
 
-func TestBuildAndPostFamilyMemberRemovalRequestUsesOrganizerAuthAndV2HeadersOnce(t *testing.T) {
+func TestBuildAndPostFamilyMemberRemovalRequestUsesExistingFamilyKitProtocolOnce(t *testing.T) {
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
-		if r.Method != http.MethodPost || r.URL.Path != "/setup/mac/family/removeFamilyMember" {
+		if r.Method != http.MethodPost || r.URL.Path != "/setup/family/removeFromFamily" {
 			t.Errorf("unexpected removal route: %s %s", r.Method, r.URL.Path)
 		}
-		if r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json, text/plist, application/x-plist" {
+		if r.Header.Get("Content-Type") != "application/x-plist" || r.Header.Get("Accept") != "application/json, text/plist, application/x-plist" {
 			t.Errorf("unexpected content negotiation headers: %#v", r.Header)
 		}
-		if r.Header.Get("Origin") != "https://setup.icloud.com" || r.Header.Get("Referer") != familyMemberRemovalReferer {
-			t.Errorf("unexpected V2 origin headers: %#v", r.Header)
-		}
-		if r.Header.Get("X-Requested-With") != "XMLHttpRequest" || r.Header.Get("X-SproutCore-Version") != "1.6.0" {
-			t.Errorf("missing V2 AJAX headers: %#v", r.Header)
-		}
-		if r.Header.Get("User-Agent") != familyMemberRemovalUserAgent || r.Header.Get("X-MMe-Client-Info") != familyMemberRemovalClientInfo {
-			t.Errorf("unexpected V2 web client headers: %#v", r.Header)
-		}
-		if r.Header.Get("Authorization") != "Basic synthetic-organizer-auth" || r.Header.Get("X-MMe-LoggedIn-AppleID") != "organizer@example.test" || r.Header.Get("X-Apple-I-MD") != "synthetic-anisette" {
+		if r.Header.Get("Authorization") != "Basic synthetic-organizer-auth" || r.Header.Get("X-MMe-LoggedIn-AppleID") != "organizer@example.test" || r.Header.Get("X-Apple-I-MD") != "synthetic-anisette" || r.Header.Get("X-Apple-Family-GS-Token") != "synthetic-family-gs" || r.Header.Get("User-Agent") != "synthetic-familykit-client" {
 			t.Errorf("organizer authentication or anisette headers were not preserved: %#v", r.Header)
 		}
 		body, err := io.ReadAll(r.Body)
@@ -676,8 +667,8 @@ func TestBuildAndPostFamilyMemberRemovalRequestUsesOrganizerAuthAndV2HeadersOnce
 			t.Errorf("could not read synthetic request body: %v", err)
 		}
 		var payload map[string]any
-		if json.Unmarshal(body, &payload) != nil || len(payload) != 1 || payload["dsid"] != "987654321" {
-			t.Errorf("unexpected removal JSON body: %s", body)
+		if _, err := plist.Unmarshal(body, &payload); err != nil || len(payload) != 1 || payload["member-dsid"] != "987654321" {
+			t.Errorf("unexpected removal plist body: %s", body)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"ec":0}`)
@@ -692,16 +683,18 @@ func TestBuildAndPostFamilyMemberRemovalRequestUsesOrganizerAuthAndV2HeadersOnce
 		request.Header.Set("Authorization", "Basic synthetic-organizer-auth")
 		request.Header.Set("X-MMe-LoggedIn-AppleID", "organizer@example.test")
 		request.Header.Set("X-Apple-I-MD", "synthetic-anisette")
+		request.Header.Set("X-Apple-Family-GS-Token", "synthetic-family-gs")
+		request.Header.Set("User-Agent", "synthetic-familykit-client")
 		return request, nil
 	}
-	request, err := buildFamilyMemberRemovalRequest(server.URL+"/setup/mac/family/removeFamilyMember", "987654321", organizerRequest)
+	request, err := buildFamilyMemberRemovalRequest(server.URL+"/setup/family/removeFromFamily", "987654321", organizerRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	removalOutcome := "not_submitted"
 	submitted, explicitlyRejected, err := postFamilyMemberRemoval(server.Client(), request, func() { removalOutcome = "unknown" })
 	if err != nil || !submitted || explicitlyRejected || removalOutcome != "unknown" || requestCount != 1 {
-		t.Fatalf("synthetic V2 removal did not submit exactly once: submitted=%t outcome=%s calls=%d err=%v", submitted, removalOutcome, requestCount, err)
+		t.Fatalf("synthetic FamilyKit removal did not submit exactly once: submitted=%t outcome=%s calls=%d err=%v", submitted, removalOutcome, requestCount, err)
 	}
 }
 
@@ -728,10 +721,38 @@ func TestPostFamilyMemberRemovalDoesNotFollowRedirectsOrReplay(t *testing.T) {
 	}
 }
 
+func TestPostFamilyMemberRemovalEmitsOnlyHTTPStatusForDiagnostics(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, "synthetic-private-response")
+	}))
+	defer server.Close()
+	request, err := http.NewRequest(http.MethodPost, server.URL, strings.NewReader("synthetic-private-body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousStdout, previousFlag := os.Stdout, familyRemovalOutcomeEnabled
+	os.Stdout, familyRemovalOutcomeEnabled = writer, true
+	t.Cleanup(func() { os.Stdout, familyRemovalOutcomeEnabled = previousStdout, previousFlag })
+	submitted, _, postErr := postFamilyMemberRemoval(server.Client(), request, nil)
+	_ = writer.Close()
+	os.Stdout, familyRemovalOutcomeEnabled = previousStdout, previousFlag
+	output, readErr := io.ReadAll(reader)
+	_ = reader.Close()
+	if !submitted || postErr == nil || readErr != nil || string(output) != "FAMILY_REMOVE_HTTP_STATUS=401\n" {
+		t.Fatalf("unexpected safe diagnostic: submitted=%t postErr=%v readErr=%v output=%q", submitted, postErr, readErr, output)
+	}
+}
+
 func TestFamilyMutationResponseRequiresExplicitSuccessfulEcOrStatus(t *testing.T) {
 	for _, payload := range []map[string]any{
 		{"ec": 0},
 		{"nested": map[string]any{"status": "0"}},
+		{"ec": 0, "Status": map[string]any{"synthetic-field": "synthetic-value"}},
 	} {
 		data, err := json.Marshal(payload)
 		if err != nil || !familyMutationResponseConfirmed(data) {
@@ -748,6 +769,8 @@ func TestFamilyMutationResponseRequiresExplicitSuccessfulEcOrStatus(t *testing.T
 	}
 	for _, data := range [][]byte{
 		[]byte(`{"ec":7}`),
+		[]byte(`{"ec":7,"Status":{"synthetic-field":"synthetic-value"}}`),
+		[]byte(`{"ec":0,"Status":{"nested":{"ec":7}}}`),
 		[]byte(`{"status":"rejected"}`),
 		[]byte(`{"success":true}`),
 		[]byte(`{}`),

@@ -32,6 +32,7 @@ import (
 	appleservices "github.com/Laky-64/appleservices"
 	"github.com/Laky-64/appleservices/gsa"
 	"github.com/Laky-64/appleservices/icloud"
+	"github.com/Laky-64/appleservices/internal/privatebody"
 	"github.com/Laky-64/appleservices/nativeadi"
 	"github.com/google/uuid"
 	"golang.org/x/net/html"
@@ -60,10 +61,6 @@ const familyRemovalOutcomePrefix = "FAMILY_REMOVE_OUTCOME="
 const familyRefKeyEnv = "APPLESERVICES_FAMILY_REF_KEY"
 const familyMemberRefEnv = "APPLESERVICES_FAMILY_MEMBER_REF"
 const familyMemberRefDomain = "appleservices-family-member-ref-v1\x00"
-const familyMemberRemovalURL = "https://setup.icloud.com/setup/mac/family/removeFamilyMember"
-const familyMemberRemovalReferer = "https://setup.icloud.com/setup/mac/family/addFamilyMemberUI"
-const familyMemberRemovalUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10) AppleWebKit/600.1.3 (KHTML, like Gecko)"
-const familyMemberRemovalClientInfo = "<MacBook Pro> <Mac OS X;10.10.0;14A314h> <webclient/731eb0905570 (com.apple.systempreferences/14.0)>"
 
 var suppressSensitiveFamilyErrors bool
 var familyRemovalOutcomeEnabled bool
@@ -148,8 +145,11 @@ func decodeObject(data []byte) (map[string]any, error) {
 
 func appleEndpoint(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
+	if err != nil || u == nil {
+		return nil, errors.New("family endpoint is outside Apple HTTPS")
+	}
 	host := strings.ToLower(u.Hostname())
-	if err != nil || u.Scheme != "https" || u.User != nil || u.Fragment != "" ||
+	if u.Scheme != "https" || u.User != nil || u.Fragment != "" ||
 		!(host == "icloud.com" || strings.HasSuffix(host, ".icloud.com") || host == "apple.com" || strings.HasSuffix(host, ".apple.com")) {
 		return nil, errors.New("family endpoint is outside Apple HTTPS")
 	}
@@ -535,23 +535,15 @@ func buildFamilyMemberRemovalRequest(endpoint, dsid string, organizerRequest fun
 	if err != nil || request == nil {
 		return nil, errors.New("family member removal request is unavailable")
 	}
-	body, err := json.Marshal(struct {
-		DSID string `json:"dsid"`
-	}{DSID: dsid})
+	body, err := plist.Marshal(map[string]any{"member-dsid": dsid}, plist.XMLFormat)
 	if err != nil {
 		return nil, errors.New("family member removal request is invalid")
 	}
 	request.Method = http.MethodPost
-	request.Body = io.NopCloser(bytes.NewReader(body))
+	request.Body = privatebody.New(body)
 	request.ContentLength = int64(len(body))
-	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Content-Type", "application/x-plist")
 	request.Header.Set("Accept", "application/json, text/plist, application/x-plist")
-	request.Header.Set("Origin", "https://setup.icloud.com")
-	request.Header.Set("Referer", familyMemberRemovalReferer)
-	request.Header.Set("X-Requested-With", "XMLHttpRequest")
-	request.Header.Set("X-SproutCore-Version", "1.6.0")
-	request.Header.Set("User-Agent", familyMemberRemovalUserAgent)
-	request.Header.Set("X-MMe-Client-Info", familyMemberRemovalClientInfo)
 	return request, nil
 }
 
@@ -602,6 +594,13 @@ func familyMutationResponseCodeState(value any) (foundCode, allCodesZero, explic
 		case map[string]any:
 			for key, child := range item {
 				normalized := normalizedFamilyKey(key)
+				if normalized == "status" {
+					switch child.(type) {
+					case map[string]any, []any:
+						visit(child)
+						continue
+					}
+				}
 				if normalized == "ec" || normalized == "status" {
 					foundCode = true
 					if zero, valid := familyResponseCodeIsZero(child); !valid {
@@ -666,6 +665,9 @@ func postFamilyMemberRemoval(client *http.Client, request *http.Request, beforeS
 	}
 	if err != nil {
 		return true, false, errors.New("family member removal transport outcome is unknown")
+	}
+	if familyRemovalOutcomeEnabled && response.StatusCode >= 100 && response.StatusCode <= 599 {
+		fmt.Printf("FAMILY_REMOVE_HTTP_STATUS=%d\n", response.StatusCode)
 	}
 	data, readErr := io.ReadAll(io.LimitReader(response.Body, (2<<20)+1))
 	if readErr != nil || len(data) > 2<<20 {
@@ -1866,9 +1868,9 @@ func run() error {
 		if _, resolveErr := resolveFamilyMemberReference(members, organizerDSID, referenceInputs.Key, referenceInputs.MemberRef); resolveErr != nil {
 			return resolveErr
 		}
-		removeURL, removeErr := appleEndpoint(familyMemberRemovalURL)
+		removeURL, removeErr := appleEndpoint(stringValue(urls["removeFromFamily"]))
 		if removeErr != nil {
-			return errors.New("family member removal endpoint is unavailable")
+			return errors.New("Apple bag did not return a valid family removal endpoint")
 		}
 		organizerRequest := func(endpoint string) (*http.Request, error) {
 			return newFamilyRequest(endpoint, false)
@@ -2035,24 +2037,14 @@ func run() error {
 		if removeErr != nil {
 			return errors.New("Apple bag did not return a valid family removal endpoint")
 		}
-		removeBody, encodeErr := plist.Marshal(map[string]any{"member-dsid": targetDSID}, plist.XMLFormat)
+		removeRequest, requestErr := buildFamilyMemberRemovalRequest(removeURL.String(), targetDSID, func(endpoint string) (*http.Request, error) {
+			return newFamilyRequest(endpoint, false)
+		})
 		targetDSID = ""
-		if encodeErr != nil {
-			return errors.New("cannot encode bound family removal request")
-		}
-		removeRequest, requestErr := newFamilyRequest(removeURL.String(), false)
 		if requestErr != nil {
 			return requestErr
 		}
-		removeRequest.Method = http.MethodPost
-		removeRequest.Body = io.NopCloser(bytes.NewReader(removeBody))
-		removeRequest.ContentLength = int64(len(removeBody))
-		removeRequest.Header.Set("Content-Type", "application/x-plist")
-		removeRequest.Header.Set("Accept", "application/json, text/plist, application/x-plist")
 		removeResponse, removeRequestErr := apiClient.Do(removeRequest)
-		for index := range removeBody {
-			removeBody[index] = 0
-		}
 		if removeRequestErr == nil {
 			removeData, readErr := io.ReadAll(io.LimitReader(removeResponse.Body, (2<<20)+1))
 			removeResponse.Body.Close()
