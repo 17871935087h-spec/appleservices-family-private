@@ -192,3 +192,12 @@ test('late response from a previously selected account cannot replace the new ac
   assert.equal(harness.elements.get('notice').hidden, true);
   assert.equal(harness.state().busy, false);
 });
+
+test('outdated worker feedback prevents a generation request before reconnect', async () => {
+  const harness = createHarness(() => { throw new Error('Old worker must not receive a generation request'); });
+  vm.runInNewContext('current={hide_my_email_update_required:true};', harness.context);
+  await harness.action('hme-generate');
+  assert.equal(harness.fetchCalls.length, 0);
+  assert.match(harness.elements.get('hmeActionStatus').textContent, /旧版后台/);
+  assert.equal(harness.elements.get('hmeReconnectButton').hidden, false);
+});

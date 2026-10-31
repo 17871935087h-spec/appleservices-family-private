@@ -73,29 +73,30 @@ type Status struct {
 	FailureStage         string    `json:"failure_stage,omitempty"`
 }
 type view struct {
-	Status               Status                  `json:"status"`
-	Devices              []control.Device        `json:"devices"`
-	Pending              *control.Pending        `json:"pending"`
-	CodeReady            bool                    `json:"code_ready"`
-	ControlReady         bool                    `json:"control_ready"`
-	Launching            bool                    `json:"launching"`
-	Message              string                  `json:"message"`
-	Account              string                  `json:"account"`
-	LoginAccount         string                  `json:"login_account,omitempty"`
-	Accounts             []AccountView           `json:"accounts,omitempty"`
-	Selected             string                  `json:"selected,omitempty"`
-	ICloudActivated      bool                    `json:"icloud_activated"`
-	Family               *control.FamilyInfo     `json:"family,omitempty"`
-	FamilyCheckedAt      string                  `json:"family_checked_at,omitempty"`
-	FamilyStale          bool                    `json:"family_stale"`
-	Storage              *icloud.StorageInfo     `json:"storage,omitempty"`
-	StorageCheckedAt     string                  `json:"storage_checked_at,omitempty"`
-	StorageStale         bool                    `json:"storage_stale"`
-	StoragePlan          *icloud.StoragePlanInfo `json:"storage_plan,omitempty"`
-	StoragePlanCheckedAt string                  `json:"storage_plan_checked_at,omitempty"`
-	StoragePlanStale     bool                    `json:"storage_plan_stale"`
-	HideMyEmailAvailable bool                    `json:"hide_my_email_available"`
-	ActivationReady      bool                    `json:"activation_ready"`
+	Status                    Status                  `json:"status"`
+	Devices                   []control.Device        `json:"devices"`
+	Pending                   *control.Pending        `json:"pending"`
+	CodeReady                 bool                    `json:"code_ready"`
+	ControlReady              bool                    `json:"control_ready"`
+	Launching                 bool                    `json:"launching"`
+	Message                   string                  `json:"message"`
+	Account                   string                  `json:"account"`
+	LoginAccount              string                  `json:"login_account,omitempty"`
+	Accounts                  []AccountView           `json:"accounts,omitempty"`
+	Selected                  string                  `json:"selected,omitempty"`
+	ICloudActivated           bool                    `json:"icloud_activated"`
+	Family                    *control.FamilyInfo     `json:"family,omitempty"`
+	FamilyCheckedAt           string                  `json:"family_checked_at,omitempty"`
+	FamilyStale               bool                    `json:"family_stale"`
+	Storage                   *icloud.StorageInfo     `json:"storage,omitempty"`
+	StorageCheckedAt          string                  `json:"storage_checked_at,omitempty"`
+	StorageStale              bool                    `json:"storage_stale"`
+	StoragePlan               *icloud.StoragePlanInfo `json:"storage_plan,omitempty"`
+	StoragePlanCheckedAt      string                  `json:"storage_plan_checked_at,omitempty"`
+	StoragePlanStale          bool                    `json:"storage_plan_stale"`
+	HideMyEmailAvailable      bool                    `json:"hide_my_email_available"`
+	HideMyEmailUpdateRequired bool                    `json:"hide_my_email_update_required"`
+	ActivationReady           bool                    `json:"activation_ready"`
 }
 type credentials struct {
 	AppleID   string `json:"apple_id"`
@@ -812,6 +813,7 @@ func (s *Server) snapshotFor(ctx context.Context, id string) view {
 			result.Pending = live.Pending
 			result.CodeReady = live.CodeReady
 			result.HideMyEmailAvailable = slices.Contains(live.Capabilities, "hide-my-email")
+			result.HideMyEmailUpdateRequired = !slices.Contains(live.Capabilities, control.HMERegionalSetupCapability)
 			result.ControlReady = true
 		}
 	}
@@ -1211,6 +1213,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				cacheSafeActionResult(selected, &result)
 				json.NewEncoder(w).Encode(result)
 				return
+			}
+			if strings.HasPrefix(action.Action, "hme-") {
+				var worker control.View
+				checkCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+				err := s.callFor(checkCtx, dir, "/view", nil, &worker)
+				cancel()
+				if err != nil || !slices.Contains(worker.Capabilities, control.HMERegionalSetupCapability) {
+					result = control.Result{Message: "当前账号仍在使用旧版后台，请点击“重新连接当前账号”并完成登录后再生成", Stage: "reconnect-required"}
+					if err != nil {
+						result.Message = err.Error()
+						result.Stage = "hme-session"
+					}
+					json.NewEncoder(w).Encode(result)
+					return
+				}
 			}
 			if err := s.callFor(r.Context(), dir, "/action", action, &result); err != nil {
 				result.Message = err.Error()

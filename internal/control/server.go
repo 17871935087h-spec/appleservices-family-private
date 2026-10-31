@@ -45,6 +45,9 @@ type View struct {
 	CodeReady    bool            `json:"code_ready"`
 	Capabilities []string        `json:"capabilities,omitempty"`
 }
+
+const HMERegionalSetupCapability = "hide-my-email-regional-setup"
+
 type Action struct {
 	Action    string `json:"action"`
 	Code      string `json:"code,omitempty"`
@@ -182,7 +185,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.mu.Lock()
-		view := View{Status: data, Devices: s.devices, Pending: s.pending, CodeReady: s.ready, Capabilities: []string{"hide-my-email"}}
+		view := View{Status: data, Devices: s.devices, Pending: s.pending, CodeReady: s.ready, Capabilities: []string{"hide-my-email", HMERegionalSetupCapability}}
 		s.mu.Unlock()
 		json.NewEncoder(w).Encode(view)
 		return

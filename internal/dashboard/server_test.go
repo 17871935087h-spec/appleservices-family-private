@@ -298,3 +298,62 @@ func TestReconnectRejectsDifferentAccountBeforeStartingWorker(t *testing.T) {
 		t.Fatal("rejected login changed account state")
 	}
 }
+
+func TestHMEActionsRequireRegionalSetupWorkerBeforeDispatch(t *testing.T) {
+	for _, modern := range []bool{false, true} {
+		t.Run(map[bool]string{false: "old-worker", true: "updated-worker"}[modern], func(t *testing.T) {
+			dir := t.TempDir()
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			server, err := New(Config{Dir: dir, Worker: executable, Port: 0})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer server.listener.Close()
+			runtime, _ := json.Marshal(map[string]any{"pid": os.Getpid(), "running": true, "authenticated": true})
+			if err := os.WriteFile(filepath.Join(dir, "runtime.json"), runtime, 0600); err != nil {
+				t.Fatal(err)
+			}
+			actionRequests := 0
+			worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/view" {
+					capabilities := []string{"hide-my-email"}
+					if modern {
+						capabilities = append(capabilities, control.HMERegionalSetupCapability)
+					}
+					_ = json.NewEncoder(w).Encode(control.View{Status: runtime, Capabilities: capabilities})
+					return
+				}
+				actionRequests++
+				_ = json.NewEncoder(w).Encode(control.Result{OK: true, Stage: "hme-list"})
+			}))
+			defer worker.Close()
+			record, _ := json.Marshal(control.Record{PID: os.Getpid(), URL: worker.URL, Token: strings.Repeat("a", 64)})
+			if err := os.WriteFile(filepath.Join(dir, "control.json"), record, 0600); err != nil {
+				t.Fatal(err)
+			}
+			view := server.snapshot(context.Background())
+			if !view.ControlReady || view.HideMyEmailUpdateRequired == modern {
+				t.Fatal("dashboard did not distinguish the old account worker")
+			}
+			request := httptest.NewRequest(http.MethodPost, server.URL()+"/api/action", strings.NewReader(`{"action":"hme-list"}`))
+			request.Header.Set("X-App-Token", server.token)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+			var result control.Result
+			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if modern {
+				if !result.OK || actionRequests != 1 {
+					t.Fatal("updated worker could not serve HME actions")
+				}
+			} else if result.OK || result.Stage != "reconnect-required" || actionRequests != 0 {
+				t.Fatal("old worker was allowed to issue another known-broken Apple request")
+			}
+		})
+	}
+}
