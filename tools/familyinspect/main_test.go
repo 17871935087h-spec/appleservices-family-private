@@ -191,7 +191,7 @@ func TestProjectFamilyPoolFailsClosedOnMissingDuplicateAndDifferentFamily(t *tes
 	}
 }
 
-func TestLoadFamilyPoolRegistryVerifiesEverySessionBinding(t *testing.T) {
+func TestLoadFamilyPoolRegistryVerifiesCurrentFamilySessionBindings(t *testing.T) {
 	if runtime.GOOS == "windows" && !strings.EqualFold(filepath.VolumeName(os.TempDir()), `D:`) {
 		t.Fatal("test temporary directory must be on D:")
 	}
@@ -199,7 +199,9 @@ func TestLoadFamilyPoolRegistryVerifiesEverySessionBinding(t *testing.T) {
 	accounts := []familyPoolRegistryAccount{
 		{ID: "01-organizer", Name: "synthetic organizer", AppleID: "organizer@example.test", Dir: filepath.Join(root, "accounts", "01-organizer")},
 		{ID: "02-member", Name: "synthetic member", AppleID: "member@example.test", Dir: filepath.Join(root, "accounts", "02-member")},
+		{ID: "03-unrelated", Name: "synthetic unrelated", AppleID: "unrelated@example.test", Dir: filepath.Join(root, "accounts", "03-unrelated")},
 	}
+	members := []any{poolMemberFixture("organizer@example.test", true, false, true), poolMemberFixture("member@example.test", false, false, false)}
 	for _, account := range accounts {
 		if err := os.MkdirAll(account.Dir, 0700); err != nil {
 			t.Fatal(err)
@@ -221,8 +223,23 @@ func TestLoadFamilyPoolRegistryVerifiesEverySessionBinding(t *testing.T) {
 		}
 	}
 	writeRegistry(accounts)
-	if _, err := loadFamilyPoolRegistry(registryPath); err != nil {
+	if _, err := loadFamilyPoolRegistry(registryPath, members); err != nil {
 		t.Fatalf("valid synthetic registry rejected: %v", err)
+	}
+	if err := os.Remove(filepath.Join(accounts[2].Dir, "session.json")); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadFamilyPoolRegistry(registryPath, members)
+	if err != nil {
+		t.Fatalf("unrelated missing session blocked current family: %v", err)
+	}
+	projection, err := projectFamilyPool(members, "organizer@example.test", loaded)
+	if err != nil || len(projection.Members) != 2 || projection.UnmappedCount != 0 {
+		t.Fatalf("current members were not bound correctly: %#v err=%v", projection, err)
+	}
+	withUnrelated := append(append([]any(nil), members...), poolMemberFixture("unrelated@example.test", false, false, false))
+	if _, err := loadFamilyPoolRegistry(registryPath, withUnrelated); err == nil {
+		t.Fatal("current member with missing session was accepted")
 	}
 
 	mismatched := append([]familyPoolRegistryAccount(nil), accounts...)
@@ -231,21 +248,31 @@ func TestLoadFamilyPoolRegistryVerifiesEverySessionBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeRegistry(mismatched)
-	if _, err := loadFamilyPoolRegistry(registryPath); err == nil {
+	if _, err := loadFamilyPoolRegistry(registryPath, members); err == nil {
 		t.Fatal("registry/session Apple ID mismatch was accepted")
 	}
 
 	if err := os.Remove(filepath.Join(accounts[1].Dir, "session.json")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadFamilyPoolRegistry(registryPath); err == nil {
+	if _, err := loadFamilyPoolRegistry(registryPath, members); err == nil {
 		t.Fatal("missing registered session identity was accepted")
+	}
+	memberSession, _ := json.Marshal(map[string]string{"appleId": accounts[1].AppleID, "DSID": "synthetic-private-dsid"})
+	if err := os.WriteFile(filepath.Join(accounts[1].Dir, "session.json"), memberSession, 0600); err != nil {
+		t.Fatal(err)
 	}
 
 	duplicate := append([]familyPoolRegistryAccount(nil), accounts...)
 	duplicate[1].AppleID = " ORGANIZER@example.test "
 	writeRegistry(duplicate)
-	if _, err := loadFamilyPoolRegistry(registryPath); err == nil {
+	if _, err := loadFamilyPoolRegistry(registryPath, members); err == nil {
 		t.Fatal("duplicate normalized registry identity was accepted")
+	}
+	duplicate[1] = accounts[1]
+	duplicate[2].AppleID = " MEMBER@example.test "
+	writeRegistry(duplicate)
+	if _, err := loadFamilyPoolRegistry(registryPath, members); err == nil {
+		t.Fatal("duplicate identity on an unrelated account was accepted")
 	}
 }

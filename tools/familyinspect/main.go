@@ -221,8 +221,22 @@ func familyPoolMemberIdentity(member map[string]any) (string, bool) {
 	return normalizeFamilyPoolAppleID(secondaryID)
 }
 
-func loadFamilyPoolRegistry(path string) (familyPoolRegistry, error) {
+func loadFamilyPoolRegistry(path string, members []any) (familyPoolRegistry, error) {
 	var registry familyPoolRegistry
+	// Only accounts actually returned by the current family response can be
+	// projected as members. Unrelated accounts may not have logged in yet.
+	memberIDs := make(map[string]bool, len(members))
+	for _, raw := range members {
+		member, ok := raw.(map[string]any)
+		if !ok {
+			return registry, errors.New("family member identity unavailable")
+		}
+		identity, valid := familyPoolMemberIdentity(member)
+		if !valid || memberIDs[identity] {
+			return registry, errors.New("family member identity unavailable")
+		}
+		memberIDs[identity] = true
+	}
 	if !filepath.IsAbs(path) {
 		return registry, errors.New("family account registry unavailable")
 	}
@@ -255,6 +269,9 @@ func loadFamilyPoolRegistry(path string) (familyPoolRegistry, error) {
 			return familyPoolRegistry{}, errors.New("family account registry invalid")
 		}
 		seenIDs[account.ID], seenAppleIDs[appleID] = true, true
+		if !memberIDs[appleID] {
+			continue
+		}
 		expectedDir := filepath.Join(root, "accounts", account.ID)
 		resolvedExpected, expectedErr := filepath.EvalSymlinks(expectedDir)
 		resolvedAccount, accountErr := filepath.EvalSymlinks(filepath.Clean(account.Dir))
@@ -1238,7 +1255,7 @@ func run() error {
 		if !ok {
 			return errors.New("current FamilyKit member identity unavailable")
 		}
-		registry, registryErr := loadFamilyPoolRegistry(*registryPath)
+		registry, registryErr := loadFamilyPoolRegistry(*registryPath, members)
 		if registryErr != nil || !familyPoolCurrentAccountRegistered(registry, *dir, saved.AppleID) {
 			return errors.New("family account registry binding failed")
 		}
