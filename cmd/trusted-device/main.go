@@ -193,6 +193,7 @@ func run() (runErr error) {
 		}
 		defer panel.Close()
 		panel.SetFamilyAddReady(!*resumeSession && password != "")
+		panel.SetFamilyAddOneShotCredentialReady(true)
 		panelCommands = panel.Commands
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -577,7 +578,7 @@ func run() (runErr error) {
 		}
 		return hmeClient.List(actionCtx)
 	}
-	performAction := func(actionCtx context.Context, action, visibleRequestID, commandCode, commandLabel, commandNote string) control.Result {
+	performAction := func(actionCtx context.Context, action, visibleRequestID, commandCode, commandLabel, commandNote, commandTargetAppleID, commandTargetPassword string) control.Result {
 		if action == "hme-accept-terms" {
 			queryCtx, done := context.WithTimeout(actionCtx, 115*time.Second)
 			defer done()
@@ -868,8 +869,19 @@ func run() (runErr error) {
 			return control.Result{OK: true, Purchase: purchase, Message: "美区 50GB 订阅和付费配额均已核验", Stage: "purchase-completed"}
 		}
 		if action == "family-info" || action == "family-add-self" || action == "family-join-storage" {
-			if action == "family-add-self" && password == "" {
-				return control.Result{Message: "目标账号后台需要重新连接后才能添加家庭成员", Stage: "family-worker-unready"}
+			oneShotCredential := commandTargetAppleID != "" || commandTargetPassword != ""
+			defer func() { commandTargetAppleID, commandTargetPassword = "", "" }()
+			familyPassword := password
+			if action == "family-add-self" {
+				var failureStage string
+				familyPassword, oneShotCredential, failureStage = resolveFamilyAddPassword(commandTargetAppleID, commandTargetPassword, appleID, *dir, password, status.Authenticated, status.VerificationRequired)
+				if failureStage != "" {
+					message := "目标账号凭据或会话绑定未确认"
+					if failureStage == "family-worker-unready" {
+						message = "目标账号后台需要重新连接后才能添加家庭成员"
+					}
+					return control.Result{Message: message, Stage: failureStage}
+				}
 			}
 			executable, execErr := os.Executable()
 			if execErr != nil {
@@ -901,11 +913,15 @@ func run() (runErr error) {
 					return control.Result{Message: "组织者账号目录无效", Stage: "family-binding"}
 				}
 				args = []string{"-dir", organizerDir, "-add-pool-member-dir", *dir, "-target-password-env", "-safe-json"}
-				env = []string{"APPLESERVICES_TARGET_PASSWORD=" + password}
+				env = []string{"APPLESERVICES_TARGET_PASSWORD=" + familyPassword}
+				familyPassword = ""
 				message, stage = "池内账号已加入家庭并通过双端回读", "family-added"
 			}
 			output, execErr := runFamilyHelper(queryCtx, helper, args, env)
 			if execErr != nil {
+				if oneShotCredential {
+					return control.Result{Message: "家庭操作未完成，请重新读取当前家庭状态", Stage: "family-action"}
+				}
 				return control.Result{Message: "家庭操作未完成：" + lastNonEmptyLine(output), Stage: "family-action"}
 			}
 			if action == "family-add-self" {
@@ -914,6 +930,9 @@ func run() (runErr error) {
 				// response as completed membership.
 				output, execErr = runFamilyHelper(queryCtx, helper, []string{"-dir", *dir, "-safe-json"}, nil)
 				if execErr != nil {
+					if oneShotCredential {
+						return control.Result{Message: "家庭操作已提交，但目标账号回读未完成", Stage: "family-readback"}
+					}
 					return control.Result{Message: "家庭已提交，但目标账号回读未完成：" + lastNonEmptyLine(output), Stage: "family-readback"}
 				}
 			}
@@ -927,6 +946,9 @@ func run() (runErr error) {
 			if action == "family-add-self" && family.StorageKnown && family.StorageAvailable && !family.StorageParticipating {
 				output, execErr = runFamilyHelper(queryCtx, helper, []string{"-dir", *dir, "-join-shared-storage", "-safe-json"}, nil)
 				if execErr != nil {
+					if oneShotCredential {
+						return control.Result{Message: "家庭成员已加入，但共享储存加入未完成", Stage: "family-storage", Family: family}
+					}
 					return control.Result{Message: "家庭成员已加入，但共享储存加入未完成：" + lastNonEmptyLine(output), Stage: "family-storage", Family: family}
 				}
 				family, parseErr = parseFamilyStatus(output)
@@ -1321,7 +1343,11 @@ func run() (runErr error) {
 				command.Reply <- control.Result{Message: "请重新查看当前登录请求"}
 				continue
 			}
-			command.Reply <- performAction(command.Context, command.Action.Action, command.RequestID, command.Code, command.Label, command.Note)
+			targetAppleID, targetPassword := command.Action.TargetAppleID, command.Action.TargetPassword
+			command.Action.TargetAppleID, command.Action.TargetPassword = "", ""
+			result := performAction(command.Context, command.Action.Action, command.RequestID, command.Code, command.Label, command.Note, targetAppleID, targetPassword)
+			targetAppleID, targetPassword = "", ""
+			command.Reply <- result
 		case <-refresh.C:
 			result := renew()
 			if status.VerificationRequired {
@@ -1421,7 +1447,7 @@ func run() (runErr error) {
 			if choice != "devices" && choice != "refresh" && choice != "code" && choice != "allow" && choice != "deny" {
 				continue
 			}
-			result := performAction(ctx, choice, "", "", "", "")
+			result := performAction(ctx, choice, "", "", "", "", "", "")
 			if result.Code != "" {
 				fmt.Println("Apple verification code:", result.Code)
 			} else {
@@ -1450,13 +1476,23 @@ const familyStatusPrefix = "FAMILY_STATUS_JSON="
 
 func runFamilyHelper(ctx context.Context, helper string, args, extraEnv []string) (string, error) {
 	command := exec.CommandContext(ctx, helper, args...)
-	command.Env = append(os.Environ(), extraEnv...)
+	command.Env = make([]string, 0, len(os.Environ())+len(extraEnv))
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if !strings.EqualFold(key, "APPLESERVICES_TARGET_PASSWORD") {
+			command.Env = append(command.Env, entry)
+		}
+	}
+	command.Env = append(command.Env, extraEnv...)
 	var output bytes.Buffer
 	command.Stdout = &output
 	command.Stderr = &output
 	err := command.Run()
 	for index := range extraEnv {
 		extraEnv[index] = ""
+	}
+	for index := range command.Env {
+		command.Env[index] = ""
 	}
 	return output.String(), err
 }

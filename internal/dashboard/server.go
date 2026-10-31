@@ -23,6 +23,7 @@ import (
 
 	"github.com/Laky-64/appleservices/icloud"
 	"github.com/Laky-64/appleservices/internal/control"
+	"github.com/Laky-64/appleservices/internal/privatebody"
 )
 
 //go:embed web/*
@@ -424,17 +425,24 @@ func (s *Server) callFor(ctx context.Context, dir, path string, body any, result
 	}
 	method := "GET"
 	var reader io.Reader
+	var contentLength int64
 	if body != nil {
 		method = "POST"
 		data, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
-		reader = bytes.NewReader(data)
+		requestBody := privatebody.New(data)
+		defer requestBody.Close()
+		reader = requestBody
+		contentLength = int64(len(data))
 	}
 	request, err := http.NewRequestWithContext(ctx, method, record.URL+path, reader)
 	if err != nil {
 		return err
+	}
+	if body != nil {
+		request.ContentLength = contentLength
 	}
 	request.Header.Set("X-Control-Token", record.Token)
 	request.Header.Set("Content-Type", "application/json")
@@ -1151,19 +1159,48 @@ func (s *Server) stopIn(ctx context.Context, dir string) error {
 		}
 	}
 }
+func (s *Server) familyAddCredentialReadiness(parent context.Context, selected *Account) control.Result {
+	if selected == nil || !verifiedGSACheckpointReady(selected.Dir, selected.AppleID) || !acceptedCheckpointReady(selected.Dir, selected.AppleID) {
+		return control.Result{Stage: "family-worker-unready", Message: "目标账号后台未就绪或需要重新连接"}
+	}
+	checkCtx, cancel := context.WithTimeout(parent, 3*time.Second)
+	defer cancel()
+	var worker control.View
+	if err := s.callFor(checkCtx, selected.Dir, "/view", nil, &worker); err != nil {
+		return control.Result{Stage: "family-worker-unready", Message: "目标账号后台未就绪或需要重新连接"}
+	}
+	var workerStatus Status
+	if json.Unmarshal(worker.Status, &workerStatus) != nil || !workerStatus.Running || !workerStatus.Authenticated || workerStatus.VerificationRequired ||
+		!slices.Contains(worker.Capabilities, control.FamilyAddOneShotCredentialCapability) {
+		return control.Result{Stage: "family-worker-unready", Message: "目标账号后台未就绪或需要重新连接"}
+	}
+	return control.Result{OK: true, Stage: "family-add-credential-ready", Message: "目标账号后台已就绪"}
+}
+
 func readJSON(w http.ResponseWriter, r *http.Request, value any) bool {
 	if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		http.Error(w, "JSON required", 415)
 		return false
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 8192)
-	decoder := json.NewDecoder(r.Body)
+	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8192))
+	defer clearSensitiveBytes(data)
+	if err != nil {
+		http.Error(w, "invalid input", 400)
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(value) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		http.Error(w, "invalid input", 400)
 		return false
 	}
 	return true
+}
+
+func clearSensitiveBytes(value []byte) {
+	for index := range value {
+		value[index] = 0
+	}
 }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-AppleServices-UI", "1")
@@ -1257,6 +1294,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !readJSON(w, r, &action) {
 				return
 			}
+			if !action.ValidCredentialFields() {
+				http.Error(w, "invalid action", http.StatusBadRequest)
+				return
+			}
+			defer func() {
+				action.TargetAppleID, action.TargetPassword = "", ""
+			}()
 			dir := s.config.Dir
 			var selected *Account
 			if account := r.URL.Query().Get("account"); account != "" {
@@ -1274,6 +1318,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			var result control.Result
+			if action.Action == "family-add-credential-readiness" {
+				result := s.familyAddCredentialReadiness(r.Context(), selected)
+				json.NewEncoder(w).Encode(result)
+				return
+			}
 			if action.Action == "family-add-readiness" {
 				if selected == nil {
 					json.NewEncoder(w).Encode(control.Result{Stage: "family-worker-unready", Message: "目标账号后台未就绪"})
@@ -1307,6 +1356,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				result = s.activationAction(r.Context(), selected, action.Action == "activation-accept", action.Code)
 				json.NewEncoder(w).Encode(result)
 				return
+			}
+			if action.Action == "family-add-self" && action.HasOneShotFamilyCredential() {
+				if selected == nil || !strings.EqualFold(strings.TrimSpace(action.TargetAppleID), strings.TrimSpace(selected.AppleID)) {
+					json.NewEncoder(w).Encode(control.Result{Stage: "family-binding", Message: "目标账号凭据绑定无效"})
+					return
+				}
+				ready := s.familyAddCredentialReadiness(r.Context(), selected)
+				if !ready.OK {
+					json.NewEncoder(w).Encode(ready)
+					return
+				}
 			}
 			if selected != nil && (action.Action == "family-info" || action.Action == "family-info-direct" || action.Action == "family-join-storage") {
 				result = s.familyAction(r.Context(), selected, action.Action == "family-join-storage", action.Action != "family-info-direct")

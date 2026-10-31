@@ -1,6 +1,6 @@
 # V2 local gateway
 
-The gateway exposes only six `POST` endpoints on `127.0.0.1:18742`. It uses the dashboard's ephemeral `X-App-Token` internally and never exposes that token, Apple IDs, credentials, cookies, family identifiers or dashboard error bodies to V2. The gateway does not support account creation, password entry, SMS or an unknown-outcome reset endpoint.
+The gateway exposes only fixed `POST` endpoints on `127.0.0.1:18742`. It uses the dashboard's ephemeral `X-App-Token` internally and never exposes that token, credentials, cookies, family identifiers or dashboard error bodies to V2. The one-shot family-add endpoint can receive the target Apple ID and password from V2 for a user-requested operation; it does not persist or return the password. The gateway does not support account creation, SMS or an unknown-outcome reset endpoint.
 
 Configuration:
 
@@ -11,6 +11,8 @@ Configuration:
 - `V2GATEWAY_LISTEN_ADDR`: optional listener; defaults to `127.0.0.1:18742`. Other bind addresses are rejected.
 
 The caller must use one-time `operation_id` values for add/remove. An interrupted or failed mutation is permanently marked `outcome_unknown` for that organizer. V2 must not retry it. The gateway has no API that clears this block.
+
+For `POST /v1/family/add-with-credential`, the gateway must uniquely bind `target_apple_id` to `target_account_id`, verify the target worker's one-shot capability, and journal the operation before invoking the mutation. The target password belongs only in the authenticated request body and the short-lived worker/helper handoff, never in a URL, log, journal or response. Send it only on the user's explicit add action. Repeating an existing operation ID must return its recorded outcome without another mutation. This pathway requires both updated services and has only been exercised with synthetic data; it does not guarantee that Apple will accept an expired session or waive further verification.
 
 For cross-machine access, forward the gateway's loopback port through SSH from the V2 host:
 

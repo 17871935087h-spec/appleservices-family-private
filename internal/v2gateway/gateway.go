@@ -17,6 +17,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Laky-64/appleservices/internal/control"
+	"github.com/Laky-64/appleservices/internal/privatebody"
 )
 
 const (
@@ -85,8 +88,10 @@ type dashboardResult struct {
 }
 
 type dashboardAction struct {
-	Action string `json:"action"`
-	Code   string `json:"code,omitempty"`
+	Action         string `json:"action"`
+	Code           string `json:"code,omitempty"`
+	TargetAppleID  string `json:"target_apple_id,omitempty"`
+	TargetPassword string `json:"target_password,omitempty"`
 }
 
 type Gateway struct {
@@ -165,11 +170,15 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnsupportedMediaType, errorReply{OK: false, Stage: "invalid_request", Message: safeInvalidRequest})
 		return
 	}
-	if r.ContentLength > maxRequestBytes {
+	requestLimit := int64(maxRequestBytes)
+	if r.URL.Path == "/v1/family/add-with-credential" {
+		requestLimit = maxCredentialRequestBytes
+	}
+	if r.ContentLength > requestLimit {
 		writeJSON(w, http.StatusRequestEntityTooLarge, errorReply{OK: false, Stage: "invalid_request", Message: safeInvalidRequest})
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, requestLimit)
 	switch r.URL.Path {
 	case "/v1/resolve":
 		g.handleResolve(w, r)
@@ -179,6 +188,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.handleFamilyPool(w, r)
 	case "/v1/family/add":
 		g.handleMutation(w, r, "family-add")
+	case "/v1/family/add-with-credential":
+		g.handleFamilyAddWithCredential(w, r)
 	case "/v1/family/remove":
 		g.handleMutation(w, r, "family-remove")
 	case "/v1/device/code":
@@ -200,7 +211,13 @@ func (g *Gateway) authorized(r *http.Request) bool {
 }
 
 func decodeRequest(w http.ResponseWriter, r *http.Request, target any) bool {
-	decoder := json.NewDecoder(r.Body)
+	data, err := io.ReadAll(r.Body)
+	defer clearGatewaySensitiveBytes(data)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorReply{OK: false, Stage: "invalid_request", Message: safeInvalidRequest})
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(target) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		writeJSON(w, http.StatusBadRequest, errorReply{OK: false, Stage: "invalid_request", Message: safeInvalidRequest})
@@ -314,6 +331,31 @@ func (g *Gateway) handleMutation(w http.ResponseWriter, r *http.Request, action 
 	if !decodeRequest(w, r, &body) {
 		return
 	}
+	g.processMutation(w, r, action, body, nil)
+}
+
+func (g *Gateway) handleFamilyAddWithCredential(w http.ResponseWriter, r *http.Request) {
+	var request familyAddCredentialRequest
+	if !decodeRequest(w, r, &request) {
+		return
+	}
+	normalizedAppleID, valid := normalizeAppleID(request.TargetAppleID)
+	if !valid || request.TargetPassword != "" && !control.ValidOneShotFamilyPassword(request.TargetPassword) {
+		writeJSON(w, http.StatusBadRequest, errorReply{OK: false, Stage: "invalid_request", Message: safeInvalidRequest})
+		return
+	}
+	body := mutationRequest{OrganizerAccountID: request.OrganizerAccountID, TargetAccountID: request.TargetAccountID, OperationID: request.OperationID}
+	credential := &familyAddCredential{targetAppleID: normalizedAppleID, password: request.TargetPassword}
+	request.TargetAppleID, request.TargetPassword = "", ""
+	defer credential.clear()
+	g.processMutation(w, r, "family-add", body, credential)
+}
+
+func (g *Gateway) processMutation(w http.ResponseWriter, r *http.Request, action string, body mutationRequest, credential *familyAddCredential) {
+	if credential != nil && action != "family-add" {
+		writeJSON(w, http.StatusBadRequest, errorReply{OK: false, Stage: "invalid_request", Message: safeInvalidRequest})
+		return
+	}
 	if !validAccountID(body.OrganizerAccountID) || !validAccountID(body.TargetAccountID) || body.OrganizerAccountID == body.TargetAccountID || !validOperationID(body.OperationID) {
 		writeJSON(w, http.StatusBadRequest, errorReply{OK: false, Stage: "invalid_request", Message: safeInvalidRequest})
 		return
@@ -327,9 +369,20 @@ func (g *Gateway) handleMutation(w http.ResponseWriter, r *http.Request, action 
 		writeJSON(w, http.StatusNotFound, errorReply{OK: false, Stage: "account-not-found", Message: safeAccountNotFound})
 		return
 	}
-	if _, ok := accountIDFromRegistry(registry, body.TargetAccountID); !ok {
+	targetEntry, targetFound := accountIDFromRegistry(registry, body.TargetAccountID)
+	if !targetFound {
 		writeJSON(w, http.StatusNotFound, errorReply{OK: false, Stage: "account-not-found", Message: safeAccountNotFound})
 		return
+	}
+	if credential != nil {
+		organizerEntry, organizerFound := accountIDFromRegistry(registry, body.OrganizerAccountID)
+		targetRegistryID, targetValid := normalizeAppleID(targetEntry.AppleID)
+		organizerRegistryID, organizerValid := normalizeAppleID(organizerEntry.AppleID)
+		if !organizerFound || !targetValid || !organizerValid || targetRegistryID != credential.targetAppleID || organizerRegistryID == credential.targetAppleID ||
+			!uniqueRegistryAppleID(registry, targetRegistryID) || !uniqueRegistryAppleID(registry, organizerRegistryID) {
+			writeJSON(w, http.StatusConflict, errorReply{OK: false, Stage: "account-binding-invalid", Message: "目标账号绑定无效"})
+			return
+		}
 	}
 	release, ok := g.acquireOrganizer(r.Context(), body.OrganizerAccountID)
 	if !ok {
@@ -345,15 +398,23 @@ func (g *Gateway) handleMutation(w http.ResponseWriter, r *http.Request, action 
 		writeJSON(w, http.StatusOK, replyFromRecord(previous))
 		return
 	}
+	if credential != nil && credential.password == "" {
+		writeJSON(w, http.StatusBadRequest, errorReply{OK: false, Stage: "invalid_request", Message: safeInvalidRequest})
+		return
+	}
 	if g.journal.isBlocked(body.OrganizerAccountID) {
 		writeJSON(w, http.StatusConflict, familyReply{OK: false, Stage: "outcome_unknown", Message: safeUnknownMessage})
 		return
 	}
 	if action == "family-add" {
+		readinessAction, readinessStage := "family-add-readiness", "family-add-ready"
+		if credential != nil {
+			readinessAction, readinessStage = "family-add-credential-readiness", "family-add-credential-ready"
+		}
 		readyCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		ready, readyErr := g.dashboardAction(readyCtx, body.TargetAccountID, "family-add-readiness", "")
+		ready, readyErr := g.dashboardAction(readyCtx, body.TargetAccountID, readinessAction, "")
 		cancel()
-		if readyErr != nil || !ready.OK || ready.Stage != "family-add-ready" {
+		if readyErr != nil || !ready.OK || ready.Stage != readinessStage {
 			writeJSON(w, http.StatusConflict, familyReply{OK: false, Stage: "family-worker-unready", Message: "目标账号后台未就绪或需要重新连接"})
 			return
 		}
@@ -379,7 +440,10 @@ func (g *Gateway) handleMutation(w http.ResponseWriter, r *http.Request, action 
 		writeJSON(w, http.StatusServiceUnavailable, familyReply{OK: false, Stage: "intent-not-persisted", Message: safeServiceFailure})
 		return
 	}
-	result, callErr := g.mutationAction(r.Context(), body, action)
+	result, callErr := g.mutationAction(r.Context(), body, action, credential)
+	if credential != nil {
+		credential.password = ""
+	}
 	if callErr != nil || !result.OK {
 		g.bestEffortReadback(body)
 		g.journal.markUnknown(body.OperationID)
@@ -500,12 +564,31 @@ func validatePoolWritePrecondition(projection *familyPoolProjection, organizerID
 	return nil
 }
 
+func uniqueRegistryAppleID(registry accountRegistry, normalized string) bool {
+	if normalized == "" {
+		return false
+	}
+	matches := 0
+	for _, account := range registry.Accounts {
+		candidate, valid := normalizeAppleID(account.AppleID)
+		if valid && candidate == normalized {
+			matches++
+		}
+	}
+	return matches == 1
+}
+
 func readStageOK(result dashboardResult) bool {
 	return result.OK && (result.Stage == "family-info" || result.Stage == "family-cache-warning")
 }
 
-func (g *Gateway) mutationAction(ctx context.Context, body mutationRequest, action string) (dashboardResult, error) {
+func (g *Gateway) mutationAction(ctx context.Context, body mutationRequest, action string, credential *familyAddCredential) (dashboardResult, error) {
 	if action == "family-add" {
+		if credential != nil {
+			result, err := g.dashboardActionWithCredential(ctx, body.TargetAccountID, "family-add-self", body.OrganizerAccountID, credential.targetAppleID, credential.password)
+			credential.password = ""
+			return result, err
+		}
 		return g.dashboardAction(ctx, body.TargetAccountID, "family-add-self", body.OrganizerAccountID)
 	}
 	return g.dashboardAction(ctx, body.OrganizerAccountID, "family-remove-member", body.TargetAccountID)
@@ -642,23 +725,37 @@ func (g *Gateway) acquireOrganizer(ctx context.Context, organizerID string) (fun
 }
 
 func (g *Gateway) dashboardAction(parent context.Context, accountID, action, code string) (dashboardResult, error) {
+	return g.dashboardActionWithCredential(parent, accountID, action, code, "", "")
+}
+
+func (g *Gateway) dashboardActionWithCredential(parent context.Context, accountID, action, code, targetAppleID, targetPassword string) (dashboardResult, error) {
 	var result dashboardResult
+	credentialPresent := targetPassword != "" || targetAppleID != ""
+	if credentialPresent && (action != "family-add-self" || strings.TrimSpace(targetAppleID) == "" || !control.ValidOneShotFamilyPassword(targetPassword)) {
+		return result, errors.New("local dashboard request failed")
+	}
 	ctx, cancel := context.WithTimeout(parent, g.config.RequestTimeout)
 	defer cancel()
 	token, err := g.dashboardToken(ctx)
 	if err != nil {
 		return result, errors.New("local dashboard unavailable")
 	}
-	body, err := json.Marshal(dashboardAction{Action: action, Code: code})
+	actionBody := dashboardAction{Action: action, Code: code, TargetAppleID: targetAppleID, TargetPassword: targetPassword}
+	body, err := json.Marshal(actionBody)
+	actionBody.TargetAppleID, actionBody.TargetPassword = "", ""
 	if err != nil {
 		return result, errors.New("local dashboard request failed")
 	}
+	requestBody := privatebody.New(body)
+	defer requestBody.Close()
 	endpoint := g.dashboardURL.ResolveReference(&url.URL{Path: "/api/action", RawQuery: "account=" + url.QueryEscape(accountID)})
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), requestBody)
 	if err != nil {
 		return result, errors.New("local dashboard request failed")
 	}
+	request.ContentLength = int64(len(body))
 	request.Header.Set("X-App-Token", token)
+	request.Header.Set("Cache-Control", "no-store")
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json")
 	response, err := g.client.Do(request)
@@ -679,6 +776,12 @@ func (g *Gateway) dashboardAction(parent context.Context, accountID, action, cod
 		return dashboardResult{}, errors.New("local dashboard response is invalid")
 	}
 	return result, nil
+}
+
+func clearGatewaySensitiveBytes(value []byte) {
+	for index := range value {
+		value[index] = 0
+	}
 }
 
 func (g *Gateway) dashboardToken(ctx context.Context) (string, error) {

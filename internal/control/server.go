@@ -2,6 +2,7 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Laky-64/appleservices/icloud"
 )
@@ -48,14 +51,43 @@ type View struct {
 
 const HMERegionalSetupCapability = "hide-my-email-regional-setup"
 const FamilyAddReadyCapability = "family-add-ready"
+const FamilyAddOneShotCredentialCapability = "family-add-one-shot-credential"
+const MaxOneShotFamilyPasswordBytes = 1024
+const maxActionRequestBytes = 8192
 
 type Action struct {
-	Action    string `json:"action"`
-	Code      string `json:"code,omitempty"`
-	RequestID string `json:"request_id,omitempty"`
-	Label     string `json:"label,omitempty"`
-	Note      string `json:"note,omitempty"`
+	Action         string `json:"action"`
+	Code           string `json:"code,omitempty"`
+	RequestID      string `json:"request_id,omitempty"`
+	Label          string `json:"label,omitempty"`
+	Note           string `json:"note,omitempty"`
+	TargetAppleID  string `json:"target_apple_id,omitempty"`
+	TargetPassword string `json:"target_password,omitempty"`
 }
+
+func ValidOneShotFamilyPassword(value string) bool {
+	if value == "" || len(value) > MaxOneShotFamilyPasswordBytes || !utf8.ValidString(value) || strings.TrimSpace(value) == "" {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func (a Action) HasOneShotFamilyCredential() bool {
+	return a.TargetAppleID != "" || a.TargetPassword != ""
+}
+
+func (a Action) ValidCredentialFields() bool {
+	if !a.HasOneShotFamilyCredential() {
+		return true
+	}
+	return a.Action == "family-add-self" && strings.TrimSpace(a.TargetAppleID) != "" && ValidOneShotFamilyPassword(a.TargetPassword)
+}
+
 type Result struct {
 	OK                  bool                            `json:"ok"`
 	Message             string                          `json:"message,omitempty"`
@@ -136,16 +168,17 @@ type Command struct {
 	Reply   chan Result
 }
 type Server struct {
-	Record         Record
-	Commands       chan Command
-	dir            string
-	listener       net.Listener
-	http           *http.Server
-	mu             sync.Mutex
-	devices        []Device
-	pending        *Pending
-	ready          bool
-	familyAddReady bool
+	Record                          Record
+	Commands                        chan Command
+	dir                             string
+	listener                        net.Listener
+	http                            *http.Server
+	mu                              sync.Mutex
+	devices                         []Device
+	pending                         *Pending
+	ready                           bool
+	familyAddReady                  bool
+	familyAddOneShotCredentialReady bool
 }
 
 func New(dir string) (*Server, error) {
@@ -185,6 +218,11 @@ func (s *Server) SetDevices(devices []Device)  { s.mu.Lock(); s.devices = device
 func (s *Server) SetPending(pending *Pending)  { s.mu.Lock(); s.pending = pending; s.mu.Unlock() }
 func (s *Server) SetReady(ready bool)          { s.mu.Lock(); s.ready = ready; s.mu.Unlock() }
 func (s *Server) SetFamilyAddReady(ready bool) { s.mu.Lock(); s.familyAddReady = ready; s.mu.Unlock() }
+func (s *Server) SetFamilyAddOneShotCredentialReady(ready bool) {
+	s.mu.Lock()
+	s.familyAddOneShotCredentialReady = ready
+	s.mu.Unlock()
+}
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -207,6 +245,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if s.familyAddReady {
 			view.Capabilities = append(view.Capabilities, FamilyAddReadyCapability)
 		}
+		if s.familyAddOneShotCredentialReady {
+			view.Capabilities = append(view.Capabilities, FamilyAddOneShotCredentialCapability)
+		}
 		s.mu.Unlock()
 		json.NewEncoder(w).Encode(view)
 		return
@@ -215,14 +256,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
-	var action Action
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&action) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+	r.Body = http.MaxBytesReader(w, r.Body, maxActionRequestBytes)
+	actionBody, readErr := io.ReadAll(r.Body)
+	defer func() {
+		for index := range actionBody {
+			actionBody[index] = 0
+		}
+	}()
+	if readErr != nil {
 		http.Error(w, `{"message":"invalid action"}`, 400)
 		return
 	}
+	var action Action
+	decoder := json.NewDecoder(bytes.NewReader(actionBody))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&action) != nil || decoder.Decode(&struct{}{}) != io.EOF || !action.ValidCredentialFields() {
+		http.Error(w, `{"message":"invalid action"}`, 400)
+		return
+	}
+	defer func() { action.TargetAppleID, action.TargetPassword = "", "" }()
 	switch action.Action {
 	case "code", "devices", "refresh", "validate-account", "allow", "deny", "submit-sms", "resend-sms", "submit-account-code", "storage-info", "storage-plan", "storage-authenticate", "storage-skill-auth-local", "storage-skill-auth-file", "storage-skill-purchase-us", "storage-preview", "storage-purchase", "storage-probe", "storage-buy", "family-info", "family-add-self", "family-join-storage", "hme-list", "hme-accept-terms", "hme-generate", "hme-reserve", "hme-forward", "hme-reachable-start", "hme-reachable-verify", "hme-update", "hme-deactivate", "hme-reactivate", "hme-delete", "submit-pairing":
 	default:

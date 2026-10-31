@@ -22,12 +22,13 @@ const (
 )
 
 type fakeDashboard struct {
-	server   *httptest.Server
-	mu       sync.Mutex
-	calls    []dashboardActionCall
-	root     int
-	addReady bool
-	handle   func(http.ResponseWriter, *http.Request, dashboardActionCall)
+	server          *httptest.Server
+	mu              sync.Mutex
+	calls           []dashboardActionCall
+	root            int
+	addReady        bool
+	credentialReady bool
+	handle          func(http.ResponseWriter, *http.Request, dashboardActionCall)
 }
 
 type dashboardActionCall struct {
@@ -37,7 +38,7 @@ type dashboardActionCall struct {
 
 func newFakeDashboard(t *testing.T, handler func(http.ResponseWriter, *http.Request, dashboardActionCall)) *fakeDashboard {
 	t.Helper()
-	fake := &fakeDashboard{handle: handler, addReady: true}
+	fake := &fakeDashboard{handle: handler, addReady: true, credentialReady: true}
 	fake.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			fake.mu.Lock()
@@ -69,6 +70,17 @@ func newFakeDashboard(t *testing.T, handler func(http.ResponseWriter, *http.Requ
 		if action.Action == "family-add-readiness" {
 			if addReady {
 				writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-add-ready"})
+			} else {
+				writeDashboardResult(w, dashboardResult{OK: false, Stage: "family-worker-unready"})
+			}
+			return
+		}
+		if action.Action == "family-add-credential-readiness" {
+			fake.mu.Lock()
+			ready := fake.credentialReady
+			fake.mu.Unlock()
+			if ready {
+				writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-add-credential-ready"})
 			} else {
 				writeDashboardResult(w, dashboardResult{OK: false, Stage: "family-worker-unready"})
 			}
@@ -377,6 +389,145 @@ func TestFamilyAddRoutesOnceAndPersistsSafeResult(t *testing.T) {
 		if bytes.Contains(data, []byte(secret)) {
 			t.Fatalf("journal leaked %q", secret)
 		}
+	}
+}
+
+func TestFamilyAddWithCredentialRoutesOnceAndKeepsSecretOutOfResponsesAndJournal(t *testing.T) {
+	registryPath := testRegistry(t, registryFixture())
+	orgBefore := familyFixture(true, true, 1, 1, 1, true, true, true, true, true, true, storage50)
+	orgAfter := familyFixture(true, true, 2, 1, 1, true, true, true, true, true, true, storage50)
+	targetBefore := familyFixture(false, false, 0, 0, 0, true, true, false, false, false, false, 0)
+	targetAfter := familyFixture(true, false, 2, 1, 1, true, true, true, true, true, true, storage50)
+	poolBefore := familyPoolFixture([]familyPoolMember{{AccountID: "org-01", Organizer: true}}, 0, 1)
+	poolAfter := familyPoolFixture([]familyPoolMember{{AccountID: "org-01", Organizer: true}, {AccountID: "target-02"}}, 0, 2)
+	secret := `one-shot-private-"credential"`
+	var mu sync.Mutex
+	reads := map[string]int{}
+	mutations, poolReads := 0, 0
+	fake := newFakeDashboard(t, func(w http.ResponseWriter, _ *http.Request, call dashboardActionCall) {
+		if call.Action.Action == "family-add-self" {
+			mu.Lock()
+			mutations++
+			mu.Unlock()
+			if call.Account != "target-02" || call.Action.Code != "org-01" || call.Action.TargetAppleID != "target@example.test" || call.Action.TargetPassword != secret {
+				t.Errorf("one-shot add was not bound/routed correctly: %#v", call)
+			}
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-added", Family: targetAfter})
+			return
+		}
+		if call.Action.Action == "family-pool" {
+			mu.Lock()
+			poolReads++
+			count := poolReads
+			mu.Unlock()
+			projection := poolBefore
+			if count > 1 {
+				projection = poolAfter
+			}
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-pool", FamilyPool: projection})
+			return
+		}
+		if call.Action.Action != "family-info-direct" || call.Action.TargetPassword != "" {
+			t.Errorf("unexpected preflight action or secret forwarding: %#v", call)
+		}
+		mu.Lock()
+		reads[call.Account]++
+		count := reads[call.Account]
+		mu.Unlock()
+		if call.Account == "org-01" && count == 1 {
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-info", Family: orgBefore})
+		} else if call.Account == "org-01" {
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-info", Family: orgAfter})
+		} else if count == 1 {
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-info", Family: targetBefore})
+		} else {
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-info", Family: targetAfter})
+		}
+	})
+	intentDir := filepath.Join(testRoot(t), "credential-add-journal")
+	g := testGateway(t, fake, registryPath, intentDir, 500*time.Millisecond)
+	requestBody, _ := json.Marshal(familyAddCredentialRequest{OrganizerAccountID: "org-01", TargetAccountID: "target-02", OperationID: "credential-add-001", TargetAppleID: " TARGET@EXAMPLE.TEST ", TargetPassword: secret})
+	request := string(requestBody)
+	response := gatewayRequest(t, g, "/v1/family/add-with-credential", request)
+	added := decodeGatewayResponse[familyReply](t, response)
+	if response.Code != http.StatusOK || !added.OK || added.Stage != "family-added" {
+		t.Fatalf("credential add failed: %d %#v", response.Code, added)
+	}
+	if strings.Contains(response.Body.String(), secret) {
+		t.Fatal("gateway response leaked the target password")
+	}
+	duplicate := gatewayRequest(t, g, "/v1/family/add-with-credential", request)
+	if duplicate.Code != http.StatusOK || !decodeGatewayResponse[familyReply](t, duplicate).OK {
+		t.Fatalf("credential operation replay did not return the saved result: %d %s", duplicate.Code, duplicate.Body.String())
+	}
+	replayWithoutPassword, _ := json.Marshal(familyAddCredentialRequest{OrganizerAccountID: "org-01", TargetAccountID: "target-02", OperationID: "credential-add-001", TargetAppleID: "target@example.test"})
+	passwordlessReplay := gatewayRequest(t, g, "/v1/family/add-with-credential", string(replayWithoutPassword))
+	if passwordlessReplay.Code != http.StatusOK || !decodeGatewayResponse[familyReply](t, passwordlessReplay).OK {
+		t.Fatalf("credential replay without password did not return saved result: %d %s", passwordlessReplay.Code, passwordlessReplay.Body.String())
+	}
+	mu.Lock()
+	mutationCount := mutations
+	mu.Unlock()
+	if mutationCount != 1 {
+		t.Fatalf("credential mutation count = %d, want exactly one", mutationCount)
+	}
+	entries, err := os.ReadDir(intentDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("credential journal entries = %d, err=%v", len(entries), err)
+	}
+	data, err := os.ReadFile(filepath.Join(intentDir, entries[0].Name()))
+	if err != nil || bytes.Contains(data, []byte(secret)) {
+		t.Fatalf("credential journal retained the password: err=%v", err)
+	}
+	calls, _ := fake.snapshot()
+	for _, call := range calls {
+		if call.Action.Action != "family-add-self" && call.Action.TargetPassword != "" {
+			t.Fatalf("preflight action received the password: %#v", call)
+		}
+	}
+}
+
+func TestFamilyAddWithCredentialRejectsBindingAndCapabilityBeforeIntent(t *testing.T) {
+	secret := "one-shot-private-secret"
+	registryPath := testRegistry(t, registryFixture())
+	fake := newFakeDashboard(t, func(w http.ResponseWriter, _ *http.Request, call dashboardActionCall) {
+		if call.Action.Action == "family-add-self" {
+			t.Error("rejected credential add reached mutation")
+		}
+	})
+	fake.credentialReady = false
+	intentDir := filepath.Join(testRoot(t), "credential-reject-journal")
+	g := testGateway(t, fake, registryPath, intentDir, 500*time.Millisecond)
+	body, _ := json.Marshal(familyAddCredentialRequest{OrganizerAccountID: "org-01", TargetAccountID: "target-02", OperationID: "credential-unready-001", TargetAppleID: "target@example.test", TargetPassword: secret})
+	response := gatewayRequest(t, g, "/v1/family/add-with-credential", string(body))
+	rejected := decodeGatewayResponse[familyReply](t, response)
+	if response.Code != http.StatusConflict || rejected.Stage != "family-worker-unready" || strings.Contains(response.Body.String(), secret) {
+		t.Fatalf("unsupported worker was not safely rejected: %d %s", response.Code, response.Body.String())
+	}
+	entries, err := os.ReadDir(intentDir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("unready worker created intent: entries=%d err=%v", len(entries), err)
+	}
+	calls, _ := fake.snapshot()
+	if len(calls) != 1 || calls[0].Action.Action != "family-add-credential-readiness" || calls[0].Action.TargetPassword != "" {
+		t.Fatalf("secret was forwarded before capability readiness: %#v", calls)
+	}
+
+	fake.credentialReady = true
+	body, _ = json.Marshal(familyAddCredentialRequest{OrganizerAccountID: "org-01", TargetAccountID: "target-02", OperationID: "credential-binding-001", TargetAppleID: "wrong@example.test", TargetPassword: secret})
+	response = gatewayRequest(t, g, "/v1/family/add-with-credential", string(body))
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "account-binding-invalid") || strings.Contains(response.Body.String(), secret) {
+		t.Fatalf("mismatched target identity was not safely rejected: %d %s", response.Code, response.Body.String())
+	}
+	entries, err = os.ReadDir(intentDir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("mismatched target created intent: entries=%d err=%v", len(entries), err)
+	}
+
+	body, _ = json.Marshal(familyAddCredentialRequest{OrganizerAccountID: "org-01", TargetAccountID: "target-02", OperationID: "credential-missing-001", TargetAppleID: "target@example.test"})
+	response = gatewayRequest(t, g, "/v1/family/add-with-credential", string(body))
+	if response.Code != http.StatusBadRequest || strings.Contains(response.Body.String(), secret) {
+		t.Fatalf("missing credential was not rejected: %d %s", response.Code, response.Body.String())
 	}
 }
 

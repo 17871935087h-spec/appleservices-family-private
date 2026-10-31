@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Laky-64/appleservices"
 	"github.com/Laky-64/appleservices/internal/control"
 )
 
@@ -80,6 +81,141 @@ func TestFamilyAddReadinessRequiresLiveWorkerCapability(t *testing.T) {
 		var result control.Result
 		if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil || result.OK != ready {
 			t.Fatalf("readiness=%v got status=%d response=%s err=%v", ready, recorder.Code, recorder.Body.String(), err)
+		}
+	}
+}
+
+func TestFamilyAddCredentialReadinessRequiresNewCapabilityAndAcceptedBinding(t *testing.T) {
+	dir := t.TempDir()
+	server, err := New(Config{Dir: dir, Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.listener.Close()
+	server.accounts = []*Account{{ID: "target-01", Dir: dir, AppleID: "target@example.invalid"}}
+	worker, err := control.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	runtimeData, _ := json.Marshal(Status{PID: os.Getpid(), Running: true, Authenticated: true})
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), runtimeData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	session := appleservices.Session{AppleID: "target@example.invalid", DSID: "gsa-dsid", Tokens: map[string]string{"com.apple.gs.idms.pet": "pet"}}
+	sessionData, _ := json.Marshal(session)
+	if err := os.WriteFile(filepath.Join(dir, "session.json"), sessionData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := struct {
+		Session     appleservices.Session `json:"session"`
+		ADSID       string                `json:"adsid"`
+		ServiceData map[string]any        `json:"service-data"`
+	}{Session: appleservices.Session{AppleID: session.AppleID, DSID: "icloud-dsid", Tokens: map[string]string{"mmeAuthToken": "mme"}}, ADSID: session.DSID, ServiceData: map[string]any{"verified": true}}
+	checkpointData, _ := json.Marshal(checkpoint)
+	if err := os.WriteFile(filepath.Join(dir, "icloud-accepted.json"), checkpointData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, ready := range []bool{false, true} {
+		worker.SetFamilyAddOneShotCredentialReady(ready)
+		request := httptest.NewRequest(http.MethodPost, server.URL()+"/api/action?account=target-01", strings.NewReader(`{"action":"family-add-credential-readiness"}`))
+		request.Header.Set("X-App-Token", server.token)
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		server.ServeHTTP(recorder, request)
+		var result control.Result
+		if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil || result.OK != ready || ready && result.Stage != "family-add-credential-ready" {
+			t.Fatalf("readiness=%v got response=%s err=%v", ready, recorder.Body.String(), err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "icloud-accepted.json"), []byte(`{"session":{"AppleID":"other@example.invalid","DSID":"icloud-dsid","Tokens":{"mmeAuthToken":"mme"}},"adsid":"gsa-dsid","service-data":{"verified":true}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	worker.SetFamilyAddOneShotCredentialReady(true)
+	request := httptest.NewRequest(http.MethodPost, server.URL()+"/api/action?account=target-01", strings.NewReader(`{"action":"family-add-credential-readiness"}`))
+	request.Header.Set("X-App-Token", server.token)
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	var result control.Result
+	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil || result.OK {
+		t.Fatalf("mismatched accepted checkpoint was accepted: %s err=%v", recorder.Body.String(), err)
+	}
+}
+
+func TestDashboardBindsAndForwardsOneShotFamilyAddCredentialTransiently(t *testing.T) {
+	dir := t.TempDir()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(Config{Dir: dir, Worker: executable, Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.listener.Close()
+	server.accounts = []*Account{{ID: "target-01", Dir: dir, AppleID: "target@example.invalid"}}
+	worker, err := control.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	worker.SetFamilyAddOneShotCredentialReady(true)
+	runtimeData, _ := json.Marshal(Status{PID: os.Getpid(), Running: true, Authenticated: true})
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), runtimeData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	session := appleservices.Session{AppleID: "target@example.invalid", DSID: "gsa-dsid", Tokens: map[string]string{"com.apple.gs.idms.pet": "pet"}}
+	sessionData, _ := json.Marshal(session)
+	if err := os.WriteFile(filepath.Join(dir, "session.json"), sessionData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := struct {
+		Session     appleservices.Session `json:"session"`
+		ADSID       string                `json:"adsid"`
+		ServiceData map[string]any        `json:"service-data"`
+	}{Session: appleservices.Session{AppleID: session.AppleID, DSID: "icloud-dsid", Tokens: map[string]string{"mmeAuthToken": "mme"}}, ADSID: session.DSID, ServiceData: map[string]any{"verified": true}}
+	checkpointData, _ := json.Marshal(checkpoint)
+	if err := os.WriteFile(filepath.Join(dir, "icloud-accepted.json"), checkpointData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	secret := `one-shot-password-"fixture"`
+	wrong := control.Action{Action: "family-add-self", Code: "org-01", TargetAppleID: "other@example.invalid", TargetPassword: secret}
+	wrongData, _ := json.Marshal(wrong)
+	request := httptest.NewRequest(http.MethodPost, server.URL()+"/api/action?account=target-01", strings.NewReader(string(wrongData)))
+	request.Header.Set("X-App-Token", server.token)
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if strings.Contains(recorder.Body.String(), secret) || !strings.Contains(recorder.Body.String(), "family-binding") {
+		t.Fatalf("mismatched target identity was not safely rejected: %s", recorder.Body.String())
+	}
+
+	received := make(chan control.Action, 1)
+	go func() {
+		command := <-worker.Commands
+		received <- command.Action
+		command.Reply <- control.Result{OK: true, Stage: "family-added", Message: "completed"}
+	}()
+	action := control.Action{Action: "family-add-self", Code: "org-01", TargetAppleID: "target@example.invalid", TargetPassword: secret}
+	data, _ := json.Marshal(action)
+	request = httptest.NewRequest(http.MethodPost, server.URL()+"/api/action?account=target-01", strings.NewReader(string(data)))
+	request.Header.Set("X-App-Token", server.token)
+	request.Header.Set("Content-Type", "application/json")
+	recorder = httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	var result control.Result
+	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil || !result.OK || strings.Contains(recorder.Body.String(), secret) {
+		t.Fatalf("one-shot request result leaked or failed: %s err=%v", recorder.Body.String(), err)
+	}
+	command := <-received
+	if command.TargetAppleID != "target@example.invalid" || command.TargetPassword != secret {
+		t.Fatalf("worker did not receive bound one-shot credential: %#v", command.Action)
+	}
+	for _, name := range []string{"control.json", "runtime.json", "session.json", "icloud-accepted.json"} {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil || strings.Contains(string(data), secret) {
+			t.Fatalf("one-shot credential persisted in %s: err=%v", name, err)
 		}
 	}
 }

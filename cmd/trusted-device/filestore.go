@@ -68,6 +68,19 @@ func (s fileStore) SaveSession(sess *appleservices.Session) error {
 	return writeJSONFile(s.sessionPath(), sess)
 }
 
+func (s fileStore) VerifyFamilyAddSessionBinding(startupAppleID string) error {
+	startupAppleID = strings.TrimSpace(startupAppleID)
+	saved, err := s.LoadSession()
+	if err != nil || saved == nil || startupAppleID == "" || saved.DSID == "" || !strings.EqualFold(saved.AppleID, startupAppleID) {
+		return errors.New("target account session binding failed")
+	}
+	accepted, err := s.LoadAcceptedICloud()
+	if err != nil || accepted.DSID == "" || accepted.ADSID != saved.DSID || accepted.MMEAuthToken == "" || accepted.ServiceData == nil {
+		return errors.New("target accepted session binding failed")
+	}
+	return nil
+}
+
 func (s fileStore) LoadAcceptedICloud() (appleservices.RestoredICloudSession, error) {
 	data, err := os.ReadFile(s.acceptedPath())
 	if err != nil {

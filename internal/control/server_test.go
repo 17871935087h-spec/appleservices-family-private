@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -68,6 +69,89 @@ func TestFamilyAddCapabilityReflectsInMemoryPasswordAvailability(t *testing.T) {
 		_ = response.Body.Close()
 		if decodeErr != nil || slices.Contains(view.Capabilities, FamilyAddReadyCapability) != ready {
 			t.Fatalf("family add capability does not match readiness=%v", ready)
+		}
+	}
+}
+
+func TestOneShotFamilyCredentialCapabilityAndRequestStayTransient(t *testing.T) {
+	dir := t.TempDir()
+	server, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	data, _ := json.Marshal(map[string]any{"pid": server.Record.PID, "running": true})
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	server.SetFamilyAddOneShotCredentialReady(true)
+	request, _ := http.NewRequest(http.MethodGet, server.Record.URL+"/view", nil)
+	request.Header.Set("X-Control-Token", server.Record.Token)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var view View
+	decodeErr := json.NewDecoder(response.Body).Decode(&view)
+	_ = response.Body.Close()
+	if decodeErr != nil || !slices.Contains(view.Capabilities, FamilyAddOneShotCredentialCapability) {
+		t.Fatalf("one-shot capability missing: %#v %v", view.Capabilities, decodeErr)
+	}
+
+	secret := `target-one-shot-"credential"`
+	received := make(chan Action, 1)
+	go func() {
+		command := <-server.Commands
+		received <- command.Action
+		command.Reply <- Result{OK: true, Stage: "family-added", Message: "completed"}
+	}()
+	body, _ := json.Marshal(Action{Action: "family-add-self", Code: "org-01", TargetAppleID: "target@example.test", TargetPassword: secret})
+	request, _ = http.NewRequest(http.MethodPost, server.Record.URL+"/action", bytes.NewReader(body))
+	request.Header.Set("X-Control-Token", server.Record.Token)
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result Result
+	decodeErr = json.NewDecoder(response.Body).Decode(&result)
+	_ = response.Body.Close()
+	if decodeErr != nil || !result.OK || strings.Contains(result.Message, secret) {
+		t.Fatalf("one-shot credential response was invalid or leaked: %#v %v", result, decodeErr)
+	}
+	command := <-received
+	if command.Action != "family-add-self" || command.TargetAppleID != "target@example.test" || command.TargetPassword != secret {
+		t.Fatalf("one-shot credential did not reach the request command: %#v", command)
+	}
+	for _, name := range []string{"control.json", "runtime.json"} {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil || bytes.Contains(data, []byte(secret)) {
+			t.Fatalf("one-shot credential persisted in %s: err=%v", name, err)
+		}
+	}
+}
+
+func TestControlRejectsCredentialFieldsOutsideFamilyAddAndOversizedPassword(t *testing.T) {
+	server, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	for _, body := range []string{
+		`{"action":"code","target_apple_id":"target@example.test","target_password":"secret"}`,
+		`{"action":"family-add-self","target_apple_id":"target@example.test","target_password":"` + strings.Repeat("a", MaxOneShotFamilyPasswordBytes+1) + `"}`,
+	} {
+		request, _ := http.NewRequest(http.MethodPost, server.Record.URL+"/action", strings.NewReader(body))
+		request.Header.Set("X-Control-Token", server.Record.Token)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("invalid credential action status=%d", response.StatusCode)
 		}
 	}
 }

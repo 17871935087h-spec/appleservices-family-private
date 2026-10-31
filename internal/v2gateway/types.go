@@ -11,11 +11,12 @@ import (
 )
 
 const (
-	DefaultListenAddr = "127.0.0.1:18742"
-	DefaultDashboard  = "http://127.0.0.1:18741"
-	maxRequestBytes   = 4096
-	maxRegistryBytes  = 256 << 10
-	maxResponseBytes  = 1 << 20
+	DefaultListenAddr         = "127.0.0.1:18742"
+	DefaultDashboard          = "http://127.0.0.1:18741"
+	maxRequestBytes           = 4096
+	maxCredentialRequestBytes = 16 << 10
+	maxRegistryBytes          = 256 << 10
+	maxResponseBytes          = 1 << 20
 )
 
 var (
@@ -90,6 +91,25 @@ type mutationRequest struct {
 	OrganizerAccountID string `json:"organizer_account_id"`
 	TargetAccountID    string `json:"target_account_id"`
 	OperationID        string `json:"operation_id"`
+}
+
+type familyAddCredentialRequest struct {
+	OrganizerAccountID string `json:"organizer_account_id"`
+	TargetAccountID    string `json:"target_account_id"`
+	OperationID        string `json:"operation_id"`
+	TargetAppleID      string `json:"target_apple_id"`
+	TargetPassword     string `json:"target_password"`
+}
+
+type familyAddCredential struct {
+	targetAppleID string
+	password      string
+}
+
+func (c *familyAddCredential) clear() {
+	if c != nil {
+		c.targetAppleID, c.password = "", ""
+	}
 }
 
 type codeReply struct {
