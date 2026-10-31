@@ -349,6 +349,15 @@ func (g *Gateway) handleMutation(w http.ResponseWriter, r *http.Request, action 
 		writeJSON(w, http.StatusConflict, familyReply{OK: false, Stage: "outcome_unknown", Message: safeUnknownMessage})
 		return
 	}
+	if action == "family-add" {
+		readyCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		ready, readyErr := g.dashboardAction(readyCtx, body.TargetAccountID, "family-add-readiness", "")
+		cancel()
+		if readyErr != nil || !ready.OK || ready.Stage != "family-add-ready" {
+			writeJSON(w, http.StatusConflict, familyReply{OK: false, Stage: "family-worker-unready", Message: "目标账号后台未就绪或需要重新连接"})
+			return
+		}
+	}
 	organizer, target, preflightErr := g.preflight(r.Context(), body, action)
 	if preflightErr != nil {
 		writeJSON(w, http.StatusConflict, familyReply{OK: false, Stage: "family-preflight", Message: safePreflightMessage})

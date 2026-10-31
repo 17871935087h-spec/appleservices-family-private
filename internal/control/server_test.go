@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -40,6 +41,34 @@ func TestControlRequiresLocalHostSecretAndNoBrowserOrigin(t *testing.T) {
 				t.Fatal("unauthorized control request reached daemon")
 			}
 		})
+	}
+}
+
+func TestFamilyAddCapabilityReflectsInMemoryPasswordAvailability(t *testing.T) {
+	dir := t.TempDir()
+	server, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	data, _ := json.Marshal(map[string]any{"pid": server.Record.PID})
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, ready := range []bool{false, true, false} {
+		server.SetFamilyAddReady(ready)
+		request, _ := http.NewRequest(http.MethodGet, server.Record.URL+"/view", nil)
+		request.Header.Set("X-Control-Token", server.Record.Token)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var view View
+		decodeErr := json.NewDecoder(response.Body).Decode(&view)
+		_ = response.Body.Close()
+		if decodeErr != nil || slices.Contains(view.Capabilities, FamilyAddReadyCapability) != ready {
+			t.Fatalf("family add capability does not match readiness=%v", ready)
+		}
 	}
 }
 

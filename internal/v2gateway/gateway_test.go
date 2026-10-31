@@ -22,11 +22,12 @@ const (
 )
 
 type fakeDashboard struct {
-	server *httptest.Server
-	mu     sync.Mutex
-	calls  []dashboardActionCall
-	root   int
-	handle func(http.ResponseWriter, *http.Request, dashboardActionCall)
+	server   *httptest.Server
+	mu       sync.Mutex
+	calls    []dashboardActionCall
+	root     int
+	addReady bool
+	handle   func(http.ResponseWriter, *http.Request, dashboardActionCall)
 }
 
 type dashboardActionCall struct {
@@ -36,7 +37,7 @@ type dashboardActionCall struct {
 
 func newFakeDashboard(t *testing.T, handler func(http.ResponseWriter, *http.Request, dashboardActionCall)) *fakeDashboard {
 	t.Helper()
-	fake := &fakeDashboard{handle: handler}
+	fake := &fakeDashboard{handle: handler, addReady: true}
 	fake.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			fake.mu.Lock()
@@ -63,11 +64,39 @@ func newFakeDashboard(t *testing.T, handler func(http.ResponseWriter, *http.Requ
 		call := dashboardActionCall{Account: r.URL.Query().Get("account"), Action: action}
 		fake.mu.Lock()
 		fake.calls = append(fake.calls, call)
+		addReady := fake.addReady
 		fake.mu.Unlock()
+		if action.Action == "family-add-readiness" {
+			if addReady {
+				writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-add-ready"})
+			} else {
+				writeDashboardResult(w, dashboardResult{OK: false, Stage: "family-worker-unready"})
+			}
+			return
+		}
 		fake.handle(w, r, call)
 	}))
 	t.Cleanup(fake.server.Close)
 	return fake
+}
+
+func TestAddRejectsPasswordlessWorkerBeforeIntent(t *testing.T) {
+	registryPath := testRegistry(t, registryFixture())
+	fake := newFakeDashboard(t, func(http.ResponseWriter, *http.Request, dashboardActionCall) {
+		t.Error("unready worker reached family reads or mutation")
+	})
+	fake.addReady = false
+	intentDir := filepath.Join(testRoot(t), "unready-journal")
+	g := testGateway(t, fake, registryPath, intentDir, 500*time.Millisecond)
+	response := gatewayRequest(t, g, "/v1/family/add", `{"organizer_account_id":"org-01","target_account_id":"target-02","operation_id":"unready-001"}`)
+	reply := decodeGatewayResponse[familyReply](t, response)
+	if response.Code != http.StatusConflict || reply.OK || reply.Stage != "family-worker-unready" {
+		t.Fatalf("unready worker was not rejected: %d %#v", response.Code, reply)
+	}
+	entries, err := os.ReadDir(intentDir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("unready worker created an intent: entries=%d err=%v", len(entries), err)
+	}
 }
 
 func (fake *fakeDashboard) snapshot() ([]dashboardActionCall, int) {

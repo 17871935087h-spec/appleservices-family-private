@@ -49,6 +49,41 @@ func TestDashboardRejectsCrossOriginAndMissingCapability(t *testing.T) {
 	}
 }
 
+func TestFamilyAddReadinessRequiresLiveWorkerCapability(t *testing.T) {
+	dir := t.TempDir()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(Config{Dir: dir, Worker: executable, Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.listener.Close()
+	server.accounts = []*Account{{ID: "target-01", Dir: dir, AppleID: "target@example.invalid"}}
+	worker, err := control.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	data, _ := json.Marshal(Status{PID: os.Getpid(), Running: true, Authenticated: true})
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, ready := range []bool{false, true} {
+		worker.SetFamilyAddReady(ready)
+		request := httptest.NewRequest(http.MethodPost, server.URL()+"/api/action?account=target-01", strings.NewReader(`{"action":"family-add-readiness"}`))
+		request.Header.Set("X-App-Token", server.token)
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		server.ServeHTTP(recorder, request)
+		var result control.Result
+		if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil || result.OK != ready {
+			t.Fatalf("readiness=%v got status=%d response=%s err=%v", ready, recorder.Code, recorder.Body.String(), err)
+		}
+	}
+}
+
 func TestDashboardFiltersRuntimeSecretsAndBindsDaemonPID(t *testing.T) {
 	dir := t.TempDir()
 	executable, err := os.Executable()

@@ -47,6 +47,7 @@ type View struct {
 }
 
 const HMERegionalSetupCapability = "hide-my-email-regional-setup"
+const FamilyAddReadyCapability = "family-add-ready"
 
 type Action struct {
 	Action    string `json:"action"`
@@ -135,15 +136,16 @@ type Command struct {
 	Reply   chan Result
 }
 type Server struct {
-	Record   Record
-	Commands chan Command
-	dir      string
-	listener net.Listener
-	http     *http.Server
-	mu       sync.Mutex
-	devices  []Device
-	pending  *Pending
-	ready    bool
+	Record         Record
+	Commands       chan Command
+	dir            string
+	listener       net.Listener
+	http           *http.Server
+	mu             sync.Mutex
+	devices        []Device
+	pending        *Pending
+	ready          bool
+	familyAddReady bool
 }
 
 func New(dir string) (*Server, error) {
@@ -179,9 +181,10 @@ func (s *Server) Close() {
 		os.Remove(path)
 	}
 }
-func (s *Server) SetDevices(devices []Device) { s.mu.Lock(); s.devices = devices; s.mu.Unlock() }
-func (s *Server) SetPending(pending *Pending) { s.mu.Lock(); s.pending = pending; s.mu.Unlock() }
-func (s *Server) SetReady(ready bool)         { s.mu.Lock(); s.ready = ready; s.mu.Unlock() }
+func (s *Server) SetDevices(devices []Device)  { s.mu.Lock(); s.devices = devices; s.mu.Unlock() }
+func (s *Server) SetPending(pending *Pending)  { s.mu.Lock(); s.pending = pending; s.mu.Unlock() }
+func (s *Server) SetReady(ready bool)          { s.mu.Lock(); s.ready = ready; s.mu.Unlock() }
+func (s *Server) SetFamilyAddReady(ready bool) { s.mu.Lock(); s.familyAddReady = ready; s.mu.Unlock() }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -201,6 +204,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Lock()
 		view := View{Status: data, Devices: s.devices, Pending: s.pending, CodeReady: s.ready, Capabilities: []string{"hide-my-email", HMERegionalSetupCapability}}
+		if s.familyAddReady {
+			view.Capabilities = append(view.Capabilities, FamilyAddReadyCapability)
+		}
 		s.mu.Unlock()
 		json.NewEncoder(w).Encode(view)
 		return

@@ -192,6 +192,7 @@ func run() (runErr error) {
 			return err
 		}
 		defer panel.Close()
+		panel.SetFamilyAddReady(!*resumeSession && password != "")
 		panelCommands = panel.Commands
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -867,6 +868,9 @@ func run() (runErr error) {
 			return control.Result{OK: true, Purchase: purchase, Message: "美区 50GB 订阅和付费配额均已核验", Stage: "purchase-completed"}
 		}
 		if action == "family-info" || action == "family-add-self" || action == "family-join-storage" {
+			if action == "family-add-self" && password == "" {
+				return control.Result{Message: "目标账号后台需要重新连接后才能添加家庭成员", Stage: "family-worker-unready"}
+			}
 			executable, execErr := os.Executable()
 			if execErr != nil {
 				return control.Result{Message: "家庭工具不可用", Stage: "family-worker"}

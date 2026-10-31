@@ -1274,6 +1274,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			var result control.Result
+			if action.Action == "family-add-readiness" {
+				if selected == nil {
+					json.NewEncoder(w).Encode(control.Result{Stage: "family-worker-unready", Message: "目标账号后台未就绪"})
+					return
+				}
+				checkCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+				var worker control.View
+				err := s.callFor(checkCtx, selected.Dir, "/view", nil, &worker)
+				cancel()
+				var workerStatus Status
+				statusErr := json.Unmarshal(worker.Status, &workerStatus)
+				if err != nil || statusErr != nil || !workerStatus.Running || !workerStatus.Authenticated || workerStatus.VerificationRequired ||
+					!slices.Contains(worker.Capabilities, control.FamilyAddReadyCapability) {
+					json.NewEncoder(w).Encode(control.Result{Stage: "family-worker-unready", Message: "目标账号后台未就绪或需要重新连接"})
+					return
+				}
+				json.NewEncoder(w).Encode(control.Result{OK: true, Stage: "family-add-ready", Message: "目标账号后台已就绪"})
+				return
+			}
 			if action.Action == "family-pool" {
 				result = s.familyPoolAction(r.Context(), selected)
 				json.NewEncoder(w).Encode(result)
