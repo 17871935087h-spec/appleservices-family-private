@@ -204,7 +204,7 @@ func TestFamilyReadNormalizesStageAndRedactsDashboardDetails(t *testing.T) {
 	registryPath := testRegistry(t, registryFixture())
 	family := familyFixture(true, true, 2, 1, 1, true, true, true, true, true, true, storage50)
 	fake := newFakeDashboard(t, func(w http.ResponseWriter, _ *http.Request, call dashboardActionCall) {
-		if call.Account != "target-02" || call.Action.Action != "family-info" || call.Action.Code != "" {
+		if call.Account != "target-02" || call.Action.Action != "family-info-direct" || call.Action.Code != "" {
 			t.Errorf("wrong read action: %#v", call)
 		}
 		writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-cache-warning", Message: json.RawMessage(`"secret@example.test raw-token-value"`), Family: family})
@@ -285,7 +285,7 @@ func TestFamilyAddRoutesOnceAndPersistsSafeResult(t *testing.T) {
 			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-pool", FamilyPool: projection})
 			return
 		}
-		if call.Action.Action != "family-info" {
+		if call.Action.Action != "family-info-direct" {
 			t.Errorf("unexpected dashboard action: %#v", call)
 		}
 		mu.Lock()
@@ -389,7 +389,7 @@ func TestFamilyRemoveRoutesToOrganizerAndAcceptsCacheWarningAfterDualReadback(t 
 			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-pool", FamilyPool: projection})
 			return
 		}
-		if call.Action.Action != "family-info" {
+		if call.Action.Action != "family-info-direct" {
 			t.Errorf("unexpected dashboard action: %#v", call)
 		}
 		mu.Lock()

@@ -257,7 +257,7 @@ func (g *Gateway) handleFamilyRead(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, familyReply{OK: false, Stage: "account-not-found", Message: safeAccountNotFound})
 		return
 	}
-	result, err := g.dashboardAction(r.Context(), body.AccountID, "family-info", "")
+	result, err := g.dashboardAction(r.Context(), body.AccountID, "family-info-direct", "")
 	if err != nil || !readStageOK(result) || result.Family == nil {
 		writeJSON(w, http.StatusBadGateway, familyReply{OK: false, Stage: "family-read-failed", Message: safeReadFailureMessage})
 		return
@@ -405,11 +405,11 @@ func (g *Gateway) handleMutation(w http.ResponseWriter, r *http.Request, action 
 }
 
 func (g *Gateway) preflight(ctx context.Context, body mutationRequest, action string) (*dashboardFamily, *dashboardFamily, error) {
-	organizerResult, err := g.dashboardAction(ctx, body.OrganizerAccountID, "family-info", "")
+	organizerResult, err := g.dashboardAction(ctx, body.OrganizerAccountID, "family-info-direct", "")
 	if err != nil || !readStageOK(organizerResult) || organizerResult.Family == nil {
 		return nil, nil, errors.New("organizer state not confirmed")
 	}
-	targetResult, err := g.dashboardAction(ctx, body.TargetAccountID, "family-info", "")
+	targetResult, err := g.dashboardAction(ctx, body.TargetAccountID, "family-info-direct", "")
 	if err != nil || !readStageOK(targetResult) || targetResult.Family == nil {
 		return nil, nil, errors.New("target state not confirmed")
 	}
@@ -513,11 +513,11 @@ func (g *Gateway) verifyAdded(ctx context.Context, body mutationRequest, result 
 	if result.Stage != "family-added" || !validAddedState(result.Family, false, expectedMembers, beforeOrganizer.StorageBytes) {
 		return nil
 	}
-	organizerAfter, err := g.dashboardAction(ctx, body.OrganizerAccountID, "family-info", "")
+	organizerAfter, err := g.dashboardAction(ctx, body.OrganizerAccountID, "family-info-direct", "")
 	if err != nil || !readStageOK(organizerAfter) || !validAddedState(organizerAfter.Family, true, expectedMembers, beforeOrganizer.StorageBytes) || !sameStorageState(beforeOrganizer, organizerAfter.Family) {
 		return nil
 	}
-	targetAfter, err := g.dashboardAction(ctx, body.TargetAccountID, "family-info", "")
+	targetAfter, err := g.dashboardAction(ctx, body.TargetAccountID, "family-info-direct", "")
 	if err != nil || !readStageOK(targetAfter) || !validAddedState(targetAfter.Family, false, expectedMembers, beforeOrganizer.StorageBytes) {
 		return nil
 	}
@@ -556,11 +556,11 @@ func (g *Gateway) verifyRemoved(ctx context.Context, body mutationRequest, resul
 	if result.Family == nil || !validOrganizerState(result.Family) || result.Family.Members != beforeOrganizer.Members-1 {
 		return nil
 	}
-	organizerAfter, err := g.dashboardAction(ctx, body.OrganizerAccountID, "family-info", "")
+	organizerAfter, err := g.dashboardAction(ctx, body.OrganizerAccountID, "family-info-direct", "")
 	if err != nil || !readStageOK(organizerAfter) || !validOrganizerState(organizerAfter.Family) || organizerAfter.Family.Members != beforeOrganizer.Members-1 || !sameStorageState(beforeOrganizer, organizerAfter.Family) {
 		return nil
 	}
-	targetAfter, err := g.dashboardAction(ctx, body.TargetAccountID, "family-info", "")
+	targetAfter, err := g.dashboardAction(ctx, body.TargetAccountID, "family-info-direct", "")
 	if err != nil || !readStageOK(targetAfter) || targetAfter.Family == nil || targetAfter.Family.Member {
 		return nil
 	}
@@ -590,8 +590,8 @@ func (g *Gateway) bestEffortReadback(body mutationRequest) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_, _ = g.dashboardAction(ctx, body.OrganizerAccountID, "family-info", "")
-	_, _ = g.dashboardAction(ctx, body.TargetAccountID, "family-info", "")
+	_, _ = g.dashboardAction(ctx, body.OrganizerAccountID, "family-info-direct", "")
+	_, _ = g.dashboardAction(ctx, body.TargetAccountID, "family-info-direct", "")
 }
 
 func validOrganizerState(family *dashboardFamily) bool {

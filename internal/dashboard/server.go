@@ -709,7 +709,7 @@ func (s *Server) resolveCachedFamilyOrganizer(currentAccount *Account, current *
 	}
 }
 
-func (s *Server) familyAction(ctx context.Context, account *Account, joinStorage bool) control.Result {
+func (s *Server) familyAction(ctx context.Context, account *Account, joinStorage, refreshPool bool) control.Result {
 	if account == nil || !acceptedCheckpointReady(account.Dir, account.AppleID) {
 		return control.Result{Message: "当前账号尚未完成 iCloud 激活", Stage: "family-preflight"}
 	}
@@ -723,10 +723,12 @@ func (s *Server) familyAction(ctx context.Context, account *Account, joinStorage
 	if err != nil {
 		return control.Result{Message: err.Error(), Stage: "family-action"}
 	}
-	if family.Organizer {
-		s.refreshPoolFamilyMembers(actionCtx, helper, account, family)
-	} else {
-		s.resolveFamilyOrganizer(actionCtx, helper, account, family)
+	if refreshPool {
+		if family.Organizer {
+			s.refreshPoolFamilyMembers(actionCtx, helper, account, family)
+		} else {
+			s.resolveFamilyOrganizer(actionCtx, helper, account, family)
+		}
 	}
 	checkedAt, cacheErr := writeFamilyCache(account, family)
 	if joinStorage && (!family.StorageKnown || !family.StorageParticipating || !family.StorageAvailable || !family.StorageEnabled) {
@@ -1287,8 +1289,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				json.NewEncoder(w).Encode(result)
 				return
 			}
-			if selected != nil && (action.Action == "family-info" || action.Action == "family-join-storage") {
-				result = s.familyAction(r.Context(), selected, action.Action == "family-join-storage")
+			if selected != nil && (action.Action == "family-info" || action.Action == "family-info-direct" || action.Action == "family-join-storage") {
+				result = s.familyAction(r.Context(), selected, action.Action == "family-join-storage", action.Action != "family-info-direct")
 				cacheSafeActionResult(selected, &result)
 				json.NewEncoder(w).Encode(result)
 				return
