@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Laky-64/appleservices/internal/control"
 	"github.com/Laky-64/appleservices/internal/privatebody"
@@ -28,6 +32,7 @@ const (
 	safeRemovedMessage      = "成员已移出并完成回读"
 	safeRemoveCacheMessage  = "成员已移出并完成回读；本地缓存未完成"
 	safeReadMessage         = "家庭状态已读取"
+	safeRosterMessage       = "家庭成员列表已读取"
 	safeReadFailureMessage  = "家庭状态未确认"
 	safePreflightMessage    = "家庭变更预检未通过"
 	safeCodeFailureMessage  = "设备码未取得"
@@ -38,7 +43,9 @@ const (
 	safeOperationIDConflict = "operation_id 已绑定其他请求"
 )
 
-var appTokenPattern = regexp.MustCompile(`(?i)<meta\s+name=["']app-token["']\s+content=["']([a-f0-9]{64})["']\s*/?>`)
+var (
+	appTokenPattern = regexp.MustCompile(`(?i)<meta\s+name=["']app-token["']\s+content=["']([a-f0-9]{64})["']\s*/?>`)
+)
 
 type dashboardFamily struct {
 	Member                 bool   `json:"member"`
@@ -65,26 +72,27 @@ type dashboardFamily struct {
 }
 
 type dashboardResult struct {
-	OK                  bool                  `json:"ok"`
-	Message             json.RawMessage       `json:"message,omitempty"`
-	Code                string                `json:"code,omitempty"`
-	CodeKind            string                `json:"code_kind,omitempty"`
-	HideAt              json.RawMessage       `json:"hide_at,omitempty"`
-	Storage             json.RawMessage       `json:"storage,omitempty"`
-	StoragePlan         json.RawMessage       `json:"storage_plan,omitempty"`
-	Purchase            json.RawMessage       `json:"purchase,omitempty"`
-	Stage               string                `json:"stage,omitempty"`
-	HTTPStatus          int                   `json:"http_status,omitempty"`
-	AppleCode           json.RawMessage       `json:"apple_code,omitempty"`
-	AppleHint           json.RawMessage       `json:"apple_hint,omitempty"`
-	StoreAuthentication json.RawMessage       `json:"store_authentication,omitempty"`
-	StoreForm           json.RawMessage       `json:"store_form,omitempty"`
-	Probes              json.RawMessage       `json:"probes,omitempty"`
-	Family              *dashboardFamily      `json:"family,omitempty"`
-	FamilyPool          *familyPoolProjection `json:"family_pool,omitempty"`
-	HideMyEmail         json.RawMessage       `json:"hide_my_email,omitempty"`
-	HMECandidate        string                `json:"hme_candidate,omitempty"`
-	Activation          json.RawMessage       `json:"activation,omitempty"`
+	OK                  bool                    `json:"ok"`
+	Message             json.RawMessage         `json:"message,omitempty"`
+	Code                string                  `json:"code,omitempty"`
+	CodeKind            string                  `json:"code_kind,omitempty"`
+	HideAt              json.RawMessage         `json:"hide_at,omitempty"`
+	Storage             json.RawMessage         `json:"storage,omitempty"`
+	StoragePlan         json.RawMessage         `json:"storage_plan,omitempty"`
+	Purchase            json.RawMessage         `json:"purchase,omitempty"`
+	Stage               string                  `json:"stage,omitempty"`
+	HTTPStatus          int                     `json:"http_status,omitempty"`
+	AppleCode           json.RawMessage         `json:"apple_code,omitempty"`
+	AppleHint           json.RawMessage         `json:"apple_hint,omitempty"`
+	StoreAuthentication json.RawMessage         `json:"store_authentication,omitempty"`
+	StoreForm           json.RawMessage         `json:"store_form,omitempty"`
+	Probes              json.RawMessage         `json:"probes,omitempty"`
+	Family              *dashboardFamily        `json:"family,omitempty"`
+	FamilyPool          *familyPoolProjection   `json:"family_pool,omitempty"`
+	FamilyRoster        *familyRosterProjection `json:"family_roster,omitempty"`
+	HideMyEmail         json.RawMessage         `json:"hide_my_email,omitempty"`
+	HMECandidate        string                  `json:"hme_candidate,omitempty"`
+	Activation          json.RawMessage         `json:"activation,omitempty"`
 }
 
 type dashboardAction struct {
@@ -186,12 +194,16 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.handleFamilyRead(w, r)
 	case "/v1/family/pool":
 		g.handleFamilyPool(w, r)
+	case "/v1/family/roster":
+		g.handleFamilyRoster(w, r)
 	case "/v1/family/add":
 		g.handleMutation(w, r, "family-add")
 	case "/v1/family/add-with-credential":
 		g.handleFamilyAddWithCredential(w, r)
 	case "/v1/family/remove":
 		g.handleMutation(w, r, "family-remove")
+	case "/v1/family/remove-by-ref":
+		g.handleFamilyRemoveByRef(w, r)
 	case "/v1/device/code":
 		g.handleDeviceCode(w, r)
 	default:
@@ -302,6 +314,145 @@ func (g *Gateway) handleFamilyPool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, familyPoolReply{OK: true, Stage: "family-pool", Message: "家庭成员映射已确认", Members: projection.Members, UnmappedCount: projection.UnmappedCount, TotalCount: projection.TotalCount})
+}
+
+func (g *Gateway) handleFamilyRoster(w http.ResponseWriter, r *http.Request) {
+	var body accountRequest
+	if !decodeRequest(w, r, &body) {
+		return
+	}
+	registry, err := loadRegistry(g.config.RegistryPath)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, familyRosterReply{OK: false, Stage: "family-roster-failed", Message: safeReadFailureMessage})
+		return
+	}
+	if _, ok := accountIDFromRegistry(registry, body.AccountID); !ok {
+		writeJSON(w, http.StatusNotFound, familyRosterReply{OK: false, Stage: "account-not-found", Message: safeAccountNotFound})
+		return
+	}
+	release, ok := g.acquireOrganizer(r.Context(), body.AccountID)
+	if !ok {
+		writeJSON(w, http.StatusConflict, familyRosterReply{OK: false, Stage: "family-busy", Message: "该组织者已有操作正在处理"})
+		return
+	}
+	defer release()
+
+	family, err := g.readOrganizerFamily(r.Context(), body.AccountID)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, familyRosterReply{OK: false, Stage: "family-roster-failed", Message: safeReadFailureMessage})
+		return
+	}
+	roster, err := g.readFamilyRoster(r.Context(), body.AccountID)
+	if err != nil || roster.TotalCount != family.Members {
+		writeJSON(w, http.StatusBadGateway, familyRosterReply{OK: false, Stage: "family-roster-failed", Message: safeReadFailureMessage})
+		return
+	}
+	writeJSON(w, http.StatusOK, familyRosterReply{OK: true, Stage: "family-roster", Message: safeRosterMessage, Members: roster.Members, UnidentifiedCount: roster.UnidentifiedCount, TotalCount: roster.TotalCount})
+}
+
+func (g *Gateway) handleFamilyRemoveByRef(w http.ResponseWriter, r *http.Request) {
+	var body familyRemoveRefRequest
+	if !decodeRequest(w, r, &body) {
+		return
+	}
+	if !validAccountID(body.OrganizerAccountID) || !validFamilyMemberRef(body.MemberRef) || !validOperationID(body.OperationID) {
+		writeJSON(w, http.StatusBadRequest, errorReply{OK: false, Stage: "invalid_request", Message: safeInvalidRequest})
+		return
+	}
+	refHash := familyMemberRefHash(body.MemberRef)
+	registry, err := loadRegistry(g.config.RegistryPath)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, familyReply{OK: false, Stage: "service-unavailable", Message: safeServiceFailure})
+		return
+	}
+	if _, ok := accountIDFromRegistry(registry, body.OrganizerAccountID); !ok {
+		writeJSON(w, http.StatusNotFound, familyReply{OK: false, Stage: "account-not-found", Message: safeAccountNotFound})
+		return
+	}
+	release, ok := g.acquireOrganizer(r.Context(), body.OrganizerAccountID)
+	if !ok {
+		writeJSON(w, http.StatusConflict, familyReply{OK: false, Stage: "family-busy", Message: "该组织者已有操作正在处理"})
+		return
+	}
+	defer release()
+	if previous, exists := g.journal.lookup(body.OperationID); exists {
+		if previous.Action != "family-remove-ref" || previous.OrganizerAccountID != body.OrganizerAccountID || previous.TargetAccountID != refHash {
+			writeJSON(w, http.StatusConflict, errorReply{OK: false, Stage: "operation-id-conflict", Message: safeOperationIDConflict})
+			return
+		}
+		writeJSON(w, http.StatusOK, replyFromRecord(previous))
+		return
+	}
+	if g.journal.isBlocked(body.OrganizerAccountID) {
+		writeJSON(w, http.StatusConflict, familyReply{OK: false, Stage: "outcome_unknown", Message: safeUnknownMessage})
+		return
+	}
+
+	// Read the organizer's live roster first. The dashboard helper independently
+	// rechecks this same ref and its role immediately before any Apple write.
+	roster, err := g.readFamilyRoster(r.Context(), body.OrganizerAccountID)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, familyReply{OK: false, Stage: "family-preflight", Message: safePreflightMessage})
+		return
+	}
+	if familyRosterRefCount(roster, body.MemberRef) != 1 {
+		writeJSON(w, http.StatusConflict, familyReply{OK: false, Stage: "family-preflight", Message: safePreflightMessage})
+		return
+	}
+	organizerBefore, err := g.readOrganizerFamily(r.Context(), body.OrganizerAccountID)
+	if err != nil || organizerBefore.Members != roster.TotalCount || organizerBefore.Members < 2 {
+		writeJSON(w, http.StatusConflict, familyReply{OK: false, Stage: "family-preflight", Message: safePreflightMessage})
+		return
+	}
+
+	record := operationRecord{Version: journalVersion, OperationID: body.OperationID, Action: "family-remove-ref", OrganizerAccountID: body.OrganizerAccountID, TargetAccountID: refHash, State: stateIntent}
+	if err := g.journal.create(record); err != nil {
+		if previous, exists := g.journal.lookup(body.OperationID); exists {
+			if previous.Action == record.Action && previous.OrganizerAccountID == record.OrganizerAccountID && previous.TargetAccountID == record.TargetAccountID {
+				writeJSON(w, http.StatusOK, replyFromRecord(previous))
+				return
+			}
+		}
+		writeJSON(w, http.StatusServiceUnavailable, familyReply{OK: false, Stage: "intent-not-persisted", Message: safeServiceFailure})
+		return
+	}
+
+	result, callErr := g.dashboardAction(r.Context(), body.OrganizerAccountID, "family-remove-ref", body.MemberRef)
+	if callErr == nil && !result.OK && result.Stage == "family-remove-preflight" {
+		notSubmitted := record
+		notSubmitted.State, notSubmitted.Stage, notSubmitted.Message = stateNotSubmitted, "family-remove-preflight", safePreflightMessage
+		if g.journal.completeNotSubmitted(notSubmitted) {
+			writeJSON(w, http.StatusConflict, replyFromRecord(notSubmitted))
+			return
+		}
+		g.journal.markUnknown(body.OperationID)
+		writeJSON(w, http.StatusOK, g.unknownReply(body.OperationID))
+		return
+	}
+	if callErr != nil || !result.OK || result.Stage != "family-member-removed" && result.Stage != "family-remove-cache-warning" {
+		g.journal.markUnknown(body.OperationID)
+		writeJSON(w, http.StatusOK, g.unknownReply(body.OperationID))
+		return
+	}
+
+	confirmed := g.verifyRemovedByRef(r.Context(), body.OrganizerAccountID, body.MemberRef, organizerBefore, roster, result)
+	if confirmed == nil {
+		g.journal.markUnknown(body.OperationID)
+		writeJSON(w, http.StatusOK, g.unknownReply(body.OperationID))
+		return
+	}
+	stage, message := "family-member-removed", safeRemovedMessage
+	if result.Stage == "family-remove-cache-warning" {
+		stage, message = "family-remove-cache-warning", safeRemoveCacheMessage
+	}
+	completed := record
+	completed.State, completed.Stage, completed.Message, completed.Family = stateSucceeded, stage, message, confirmed
+	if !g.journal.complete(completed) {
+		g.journal.markUnknown(body.OperationID)
+		writeJSON(w, http.StatusOK, g.unknownReply(body.OperationID))
+		return
+	}
+	writeJSON(w, http.StatusOK, replyFromRecord(completed))
 }
 
 func (g *Gateway) handleDeviceCode(w http.ResponseWriter, r *http.Request) {
@@ -528,6 +679,82 @@ func (g *Gateway) readFamilyPool(ctx context.Context, accountID string, registry
 	return projection, nil
 }
 
+func (g *Gateway) readOrganizerFamily(ctx context.Context, organizerID string) (*dashboardFamily, error) {
+	result, err := g.dashboardAction(ctx, organizerID, "family-info-direct", "")
+	if err != nil || !readStageOK(result) || !validOrganizerState(result.Family) || result.Family.Members < 1 {
+		return nil, errors.New("organizer family state unavailable")
+	}
+	return result.Family, nil
+}
+
+func (g *Gateway) readFamilyRoster(ctx context.Context, organizerID string) (*familyRosterProjection, error) {
+	result, err := g.dashboardAction(ctx, organizerID, "family-roster", "")
+	if err != nil || !result.OK || result.Stage != "family-roster" || !validFamilyRoster(result.FamilyRoster) {
+		return nil, errors.New("live family roster unavailable")
+	}
+	return result.FamilyRoster, nil
+}
+
+func validFamilyRoster(roster *familyRosterProjection) bool {
+	if roster == nil || roster.Members == nil || roster.TotalCount < 1 || roster.TotalCount > maxFamilyRosterMembers || roster.UnidentifiedCount < 0 || roster.UnidentifiedCount > roster.TotalCount-1 || len(roster.Members) > roster.TotalCount-1 || len(roster.Members)+roster.UnidentifiedCount > roster.TotalCount-1 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(roster.Members))
+	for _, member := range roster.Members {
+		if !validFamilyMemberRef(member.Ref) || !validMaskedFamilyLabel(member.Label) {
+			return false
+		}
+		if _, duplicate := seen[member.Ref]; duplicate {
+			return false
+		}
+		seen[member.Ref] = struct{}{}
+	}
+	return true
+}
+
+func validFamilyMemberRef(ref string) bool {
+	if len(ref) != 43 {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(ref)
+	if err != nil || len(decoded) != sha256.Size {
+		return false
+	}
+	return base64.RawURLEncoding.EncodeToString(decoded) == ref
+}
+
+func validMaskedFamilyLabel(label string) bool {
+	if label == "" || label != strings.TrimSpace(label) || len(label) > 128 || !utf8.ValidString(label) || unicodeIndexControl(label) || strings.Count(label, "@") > 1 {
+		return false
+	}
+	if at := strings.IndexByte(label, '@'); at >= 0 && !strings.ContainsAny(label[:at], "*•") {
+		return false
+	}
+	return true
+}
+
+func unicodeIndexControl(value string) bool {
+	return strings.IndexFunc(value, unicode.IsControl) >= 0
+}
+
+func familyMemberRefHash(ref string) string {
+	digest := sha256.Sum256([]byte(ref))
+	return hex.EncodeToString(digest[:])
+}
+
+func familyRosterRefCount(roster *familyRosterProjection, ref string) int {
+	if roster == nil {
+		return 0
+	}
+	count := 0
+	for _, member := range roster.Members {
+		if member.Ref == ref {
+			count++
+		}
+	}
+	return count
+}
+
 func findPoolMember(projection *familyPoolProjection, accountID string) (familyPoolMember, bool) {
 	if projection == nil {
 		return familyPoolMember{}, false
@@ -673,6 +900,26 @@ func (g *Gateway) verifyRemoved(ctx context.Context, body mutationRequest, resul
 		return nil
 	}
 	return publicFamily(organizerAfter.Family)
+}
+
+func (g *Gateway) verifyRemovedByRef(ctx context.Context, organizerID, memberRef string, beforeFamily *dashboardFamily, beforeRoster *familyRosterProjection, result dashboardResult) *Family {
+	if beforeFamily == nil || beforeRoster == nil || !validOrganizerState(beforeFamily) || beforeFamily.Members < 2 || beforeFamily.Members != beforeRoster.TotalCount || familyRosterRefCount(beforeRoster, memberRef) != 1 {
+		return nil
+	}
+	expectedMembers := beforeFamily.Members - 1
+	if !validOrganizerState(result.Family) || result.Family.Members != expectedMembers {
+		return nil
+	}
+
+	rosterAfter, err := g.readFamilyRoster(ctx, organizerID)
+	if err != nil || rosterAfter.TotalCount != expectedMembers || rosterAfter.TotalCount != beforeRoster.TotalCount-1 || familyRosterRefCount(rosterAfter, memberRef) != 0 {
+		return nil
+	}
+	familyAfter, err := g.readOrganizerFamily(ctx, organizerID)
+	if err != nil || familyAfter.Members != expectedMembers || familyAfter.Members != rosterAfter.TotalCount {
+		return nil
+	}
+	return publicFamily(familyAfter)
 }
 
 func (g *Gateway) bestEffortReadback(body mutationRequest) {

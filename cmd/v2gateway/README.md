@@ -12,6 +12,8 @@ Configuration:
 
 The caller must use one-time `operation_id` values for add/remove. An interrupted or failed mutation is permanently marked `outcome_unknown` for that organizer. V2 must not retry it. The gateway has no API that clears this block.
 
+For organizer-only removal, `POST /v1/family/roster` reads the current organizer's family and returns redacted labels and opaque member references. `POST /v1/family/remove-by-ref` uses one of those references and an operation ID; it does not require the member to be registered or logged in. The dashboard rejects stale or ambiguous references, organizers, and child accounts before submission. An unconfirmed submission remains blocked across restarts. These endpoints have been tested with synthetic data; a real Apple removal has not been validated for this implementation.
+
 For `POST /v1/family/add-with-credential`, the gateway must uniquely bind `target_apple_id` to `target_account_id`, verify the target worker's one-shot capability, and journal the operation before invoking the mutation. The target password belongs only in the authenticated request body and the short-lived worker/helper handoff, never in a URL, log, journal or response. Send it only on the user's explicit add action. Repeating an existing operation ID must return its recorded outcome without another mutation. This pathway requires both updated services and has only been exercised with synthetic data; it does not guarantee that Apple will accept an expired session or waive further verification.
 
 For cross-machine access, forward the gateway's loopback port through SSH from the V2 host:

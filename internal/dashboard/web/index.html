@@ -61,9 +61,10 @@
       <button class="button button-light" id="familyJoinStorageButton" disabled>仅加入共享储存</button>
     </div>
     <div class="family-remove-controls" id="familyRemoveControls" hidden>
-      <div><strong>成员管理</strong><small>从当前家庭移出一个池内普通成员</small></div>
-      <select id="familyRemoveMember" aria-label="要移出的家庭成员"></select>
+      <div><strong>组织者家庭成员</strong><small>名单来自组织者当前 Apple roster；成员无需登录本机面板。</small><button class="button button-light" id="familyRosterButton" type="button" disabled>读取家庭成员</button></div>
+      <select id="familyRemoveMember" aria-label="要移出的家庭成员" disabled><option value="">请先读取家庭成员</option></select>
       <button class="button button-danger" id="familyRemoveButton" disabled>移出家庭</button>
+      <p id="familyRosterStatus" role="status" aria-live="polite">点击“读取家庭成员”后，显示组织者当前成员；无法识别的成员不会提供移除选项。</p>
     </div>
     <p class="family-safety" id="familySafety">购买共享和位置共享不会开启；验证码仅在 Apple 挑战出现后由当前账号自己的本地 Mac 身份生成。</p>
   </section>

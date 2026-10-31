@@ -12,10 +12,11 @@ import (
 )
 
 const (
-	journalVersion = 1
-	stateIntent    = "intent"
-	stateSucceeded = "succeeded"
-	stateUnknown   = "outcome_unknown"
+	journalVersion    = 1
+	stateIntent       = "intent"
+	stateSucceeded    = "succeeded"
+	stateUnknown      = "outcome_unknown"
+	stateNotSubmitted = "not_submitted"
 )
 
 type operationRecord struct {
@@ -79,10 +80,7 @@ func openJournal(dir string) (*journal, error) {
 }
 
 func validRecord(record operationRecord) bool {
-	if record.Version != journalVersion || !validOperationID(record.OperationID) || !validAccountID(record.OrganizerAccountID) || !validAccountID(record.TargetAccountID) || record.OrganizerAccountID == record.TargetAccountID {
-		return false
-	}
-	if record.Action != "family-add" && record.Action != "family-remove" {
+	if record.Version != journalVersion || !validOperationID(record.OperationID) || !validAccountID(record.OrganizerAccountID) || !validJournalTarget(record.Action, record.OrganizerAccountID, record.TargetAccountID) {
 		return false
 	}
 	switch record.State {
@@ -90,11 +88,35 @@ func validRecord(record operationRecord) bool {
 		return record.Stage == "" && record.Message == "" && record.Family == nil
 	case stateUnknown:
 		return record.Stage == "outcome_unknown" && record.Message == safeUnknownMessage && record.Family == nil
+	case stateNotSubmitted:
+		return record.Action == "family-remove-ref" && record.Stage == "family-remove-preflight" && record.Message == safePreflightMessage && record.Family == nil
 	case stateSucceeded:
 		if record.Action == "family-add" {
 			return record.Stage == "family-added" && record.Message == safeAddedMessage && record.Family != nil
 		}
-		return (record.Stage == "family-member-removed" && record.Message == safeRemovedMessage || record.Stage == "family-remove-cache-warning" && record.Message == safeRemoveCacheMessage) && record.Family != nil
+		if record.Action == "family-remove" || record.Action == "family-remove-ref" {
+			return (record.Stage == "family-member-removed" && record.Message == safeRemovedMessage || record.Stage == "family-remove-cache-warning" && record.Message == safeRemoveCacheMessage) && record.Family != nil
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func validJournalTarget(action, organizerID, target string) bool {
+	switch action {
+	case "family-add", "family-remove":
+		return validAccountID(target) && organizerID != target
+	case "family-remove-ref":
+		if len(target) != 64 {
+			return false
+		}
+		for _, r := range target {
+			if !(r >= '0' && r <= '9') && !(r >= 'a' && r <= 'f') {
+				return false
+			}
+		}
+		return true
 	default:
 		return false
 	}
@@ -152,6 +174,24 @@ func (j *journal) complete(record operationRecord) bool {
 	defer j.mu.Unlock()
 	current, ok := j.records[record.OperationID]
 	if !ok || current.State != stateIntent || current.Action != record.Action || current.OrganizerAccountID != record.OrganizerAccountID || current.TargetAccountID != record.TargetAccountID || !validRecord(record) || record.State != stateSucceeded {
+		if ok {
+			j.blocked[current.OrganizerAccountID] = true
+		}
+		return false
+	}
+	if err := j.writeRecord(record); err != nil {
+		j.blocked[current.OrganizerAccountID] = true
+		return false
+	}
+	j.records[record.OperationID] = record
+	return true
+}
+
+func (j *journal) completeNotSubmitted(record operationRecord) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	current, ok := j.records[record.OperationID]
+	if !ok || current.State != stateIntent || current.Action != record.Action || current.OrganizerAccountID != record.OrganizerAccountID || current.TargetAccountID != record.TargetAccountID || !validRecord(record) || record.State != stateNotSubmitted {
 		if ok {
 			j.blocked[current.OrganizerAccountID] = true
 		}

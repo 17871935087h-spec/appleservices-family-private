@@ -1,7 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -9,6 +16,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"howett.net/plist"
 )
 
 func TestSafeFamilyUIFormsOmitsValuesAndResolvesAppleAction(t *testing.T) {
@@ -274,5 +283,502 @@ func TestLoadFamilyPoolRegistryVerifiesCurrentFamilySessionBindings(t *testing.T
 	writeRegistry(duplicate)
 	if _, err := loadFamilyPoolRegistry(registryPath, members); err == nil {
 		t.Fatal("duplicate identity on an unrelated account was accepted")
+	}
+}
+
+func refRosterMember(appleID, dsid string, organizer, child, self any) map[string]any {
+	member := map[string]any{
+		"appleId":                 appleID,
+		"member-dsid":             dsid,
+		"member-is-organizer":     organizer,
+		"member-is-child-account": child,
+	}
+	if self != nil {
+		member["is-me"] = self
+	}
+	return member
+}
+
+func TestConsumeFamilyReferenceInputsUnsetsEnvironmentAndRequiresUnpaddedValues(t *testing.T) {
+	key := bytes.Repeat([]byte{0x42}, 32)
+	ref := bytes.Repeat([]byte{0x24}, 32)
+	t.Setenv(familyRefKeyEnv, base64.RawURLEncoding.EncodeToString(key))
+	t.Setenv(familyMemberRefEnv, base64.RawURLEncoding.EncodeToString(ref))
+	inputs := consumeFamilyReferenceInputs()
+	defer clearFamilyReferenceInputs(&inputs)
+	if !inputs.KeyPresent || !inputs.KeyValid || !bytes.Equal(inputs.Key, key) || !inputs.RefPresent || !inputs.RefValid || !bytes.Equal(inputs.MemberRef, ref) {
+		t.Fatal("valid family reference inputs were not decoded")
+	}
+	if _, exists := os.LookupEnv(familyRefKeyEnv); exists {
+		t.Fatal("family reference key remained in the environment")
+	}
+	if _, exists := os.LookupEnv(familyMemberRefEnv); exists {
+		t.Fatal("family member reference remained in the environment")
+	}
+
+	for _, value := range []string{
+		base64.URLEncoding.EncodeToString(key),
+		base64.RawURLEncoding.EncodeToString(key) + "=",
+		base64.RawURLEncoding.EncodeToString(key[:31]),
+	} {
+		if _, ok := decodeFamilyReferenceValue(value); ok {
+			t.Fatalf("invalid key encoding was accepted: %q", value)
+		}
+	}
+}
+
+func TestFamilyReferenceIsDomainSeparatedAndOpaque(t *testing.T) {
+	key := bytes.Repeat([]byte{0x73}, 32)
+	ref, err := familyMemberReference(key, "123456789")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, ok := decodeFamilyReferenceValue(ref)
+	if !ok || len(decoded) != 32 {
+		t.Fatalf("generated family reference is invalid: %q", ref)
+	}
+	other, err := familyMemberReference(key, "123456788")
+	if err != nil || other == ref {
+		t.Fatalf("distinct DSIDs produced the same reference: %q %q err=%v", ref, other, err)
+	}
+	if _, err := familyMemberReference(key[:31], "123456789"); err == nil {
+		t.Fatal("short HMAC key was accepted")
+	}
+	if canonicalFamilyMemberDSID("000123") != "123" || canonicalFamilyMemberDSID("000") != "" || canonicalFamilyMemberDSID("12x") != "" {
+		t.Fatal("family DSID canonicalization did not reject zero or nonnumeric IDs")
+	}
+}
+
+func TestProjectFamilyReferenceRosterRedactsAndExcludesUnsafeMembers(t *testing.T) {
+	key := bytes.Repeat([]byte{0x51}, 32)
+	members := []any{
+		refRosterMember("organizer@example.test", "100", true, false, true),
+		refRosterMember("member@example.test", "200", false, false, false),
+		refRosterMember("child@example.test", "300", false, true, false),
+		map[string]any{"appleId": "unknown@example.test", "member-dsid": "400", "member-is-organizer": false},
+		refRosterMember("dup-one@example.test", "500", false, false, false),
+		refRosterMember("dup-two@example.test", "500", false, false, false),
+	}
+	projection, byRef, err := projectFamilyReferenceRoster(members, "100", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.TotalCount != 6 || projection.UnidentifiedCount != 3 || len(projection.Members) != 1 {
+		t.Fatalf("unexpected roster projection: %#v", projection)
+	}
+	if projection.Members[0].Label != "m***r@example.test" || len(byRef) != 1 || byRef[projection.Members[0].Ref] != "200" {
+		t.Fatalf("unexpected safe family candidate: %#v %#v", projection.Members, byRef)
+	}
+	encoded, err := json.Marshal(projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"organizer@example.test", "member@example.test", "unknown@example.test", "child@example.test", "100", "200", "500", "family-id", "token"} {
+		if bytes.Contains(encoded, []byte(secret)) {
+			t.Fatalf("roster projection leaked %q: %s", secret, encoded)
+		}
+	}
+}
+
+func TestMaskedFamilyAppleIDUsesLongAccountEdgesAndStricterShortMasking(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		want  string
+	}{
+		{input: "ab123456cd@qq.com", want: "ab***cd@qq.com"},
+		{input: "abc@qq.com", want: "a***c@qq.com"},
+		{input: "ab@qq.com", want: "a***@qq.com"},
+		{input: "a@qq.com", want: "a***@qq.com"},
+	} {
+		if got := maskedFamilyAppleID(test.input); got != test.want {
+			t.Fatalf("unexpected masked Apple ID: got=%q want=%q", got, test.want)
+		}
+		if strings.Contains(test.want, test.input) {
+			t.Fatalf("mask preserved the complete account: %q", test.want)
+		}
+	}
+}
+
+func TestFamilyRosterBlocksDuplicateMaskedLabels(t *testing.T) {
+	key := bytes.Repeat([]byte{0x35}, 32)
+	members := []any{
+		refRosterMember("organizer@example.test", "100", true, false, true),
+		refRosterMember("ab123456cd@qq.com", "200", false, false, false),
+		refRosterMember("ab999999cd@qq.com", "300", false, false, false),
+	}
+	projection, byRef, err := projectFamilyReferenceRoster(members, "100", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Members) != 0 || projection.UnidentifiedCount != 2 || len(byRef) != 0 {
+		t.Fatalf("duplicate masked labels were not excluded: projection=%#v refs=%#v", projection, byRef)
+	}
+}
+
+func TestProjectFamilyReferenceRosterFailsClosedOnAmbiguousOrganizer(t *testing.T) {
+	key := bytes.Repeat([]byte{0x19}, 32)
+	valid := []any{
+		refRosterMember("organizer@example.test", "100", true, false, true),
+		refRosterMember("member@example.test", "200", false, false, false),
+	}
+	for _, test := range []struct {
+		name    string
+		members []any
+	}{
+		{name: "missing current organizer child marker", members: []any{map[string]any{"appleId": "organizer@example.test", "member-dsid": "100", "member-is-organizer": true, "is-me": true}, valid[1]}},
+		{name: "current organizer is not marked organizer", members: []any{refRosterMember("organizer@example.test", "100", false, false, true), valid[1]}},
+		{name: "duplicate current DSID", members: []any{valid[0], valid[1], refRosterMember("other@example.test", "100", false, false, false)}},
+		{name: "second organizer", members: []any{valid[0], refRosterMember("member@example.test", "200", true, false, false)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := projectFamilyReferenceRoster(test.members, "100", key); err == nil {
+				t.Fatal("ambiguous current organizer was accepted")
+			}
+		})
+	}
+}
+
+func TestProjectFamilyReferenceRosterCountsMissingOrWrongCandidateMarkers(t *testing.T) {
+	key := bytes.Repeat([]byte{0x61}, 32)
+	organizer := refRosterMember("organizer@example.test", "100", true, false, true)
+	for _, candidate := range []map[string]any{
+		{"appleId": "member@example.test", "member-dsid": "200", "member-is-child-account": false},
+		{"appleId": "member@example.test", "member-dsid": "200", "member-is-organizer": false},
+		{"appleId": "member@example.test", "member-dsid": "200", "member-is-organizer": false, "member-is-child-account": false, "is-me": "false"},
+		{"member-dsid": "200", "member-is-organizer": false, "member-is-child-account": false},
+	} {
+		projection, _, err := projectFamilyReferenceRoster([]any{organizer, candidate}, "100", key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(projection.Members) != 0 || projection.UnidentifiedCount != 1 {
+			t.Fatalf("unsafe candidate was not counted and excluded: %#v", projection)
+		}
+	}
+}
+
+func TestResolveFamilyMemberReferenceRequiresCurrentUniqueCandidate(t *testing.T) {
+	key := bytes.Repeat([]byte{0x31}, 32)
+	members := []any{
+		refRosterMember("organizer@example.test", "100", true, false, true),
+		refRosterMember("member@example.test", "200", false, false, false),
+		refRosterMember("child@example.test", "300", false, true, false),
+	}
+	ref, err := familyMemberReference(key, "200")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, _ := decodeFamilyReferenceValue(ref)
+	defer clearFamilyReferenceInputs(&familyReferenceInputs{MemberRef: decoded})
+	if got, err := resolveFamilyMemberReference(members, "100", key, decoded); err != nil || got != "200" {
+		t.Fatalf("current roster did not resolve the opaque reference: %q err=%v", got, err)
+	}
+	childRef, _ := familyMemberReference(key, "300")
+	childBytes, _ := decodeFamilyReferenceValue(childRef)
+	if _, err := resolveFamilyMemberReference(members, "100", key, childBytes); err == nil {
+		t.Fatal("child reference resolved as a removable candidate")
+	}
+	missingRef, _ := familyMemberReference(key, "999")
+	missingBytes, _ := decodeFamilyReferenceValue(missingRef)
+	if _, err := resolveFamilyMemberReference(members, "100", key, missingBytes); err == nil {
+		t.Fatal("reference for an absent member matched the current roster")
+	}
+}
+
+func TestRemoveFamilyMemberReferenceSubmitsOnceAndConfirmsByOrganizerReadbackWithoutTargetSession(t *testing.T) {
+	key := bytes.Repeat([]byte{0x72}, 32)
+	initial := []any{
+		refRosterMember("organizer@example.test", "100", true, false, true),
+		refRosterMember("member@example.test", "200", false, false, false),
+	}
+	ref, err := familyMemberReference(key, "200")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refBytes, _ := decodeFamilyReferenceValue(ref)
+	removeCalls, readbackCalls := 0, 0
+	verified, err := removeFamilyMemberReference(initial, "100", key, refBytes,
+		func(dsid string) (bool, bool, error) {
+			removeCalls++
+			if dsid != "200" {
+				t.Fatal("opaque reference resolved to an unexpected DSID")
+			}
+			return true, false, errors.New("synthetic transport outcome unknown")
+		},
+		func() ([]any, error) {
+			readbackCalls++
+			return []any{initial[0]}, nil
+		}, func() {},
+	)
+	if err != nil || removeCalls != 1 || readbackCalls != 1 || len(verified) != 1 {
+		t.Fatalf("confirmed removal failed or was repeated: verified=%#v remove=%d readback=%d err=%v", verified, removeCalls, readbackCalls, err)
+	}
+}
+
+func TestRemoveFamilyMemberReferenceDoesNotSubmitForMissingOrIneligibleTarget(t *testing.T) {
+	key := bytes.Repeat([]byte{0x28}, 32)
+	initial := []any{
+		refRosterMember("organizer@example.test", "100", true, false, true),
+		refRosterMember("child@example.test", "300", false, true, false),
+	}
+	for _, targetDSID := range []string{"200", "300"} {
+		ref, _ := familyMemberReference(key, targetDSID)
+		refBytes, _ := decodeFamilyReferenceValue(ref)
+		removeCalls, readbackCalls := 0, 0
+		if _, err := removeFamilyMemberReference(initial, "100", key, refBytes,
+			func(string) (bool, bool, error) { removeCalls++; return true, false, nil },
+			func() ([]any, error) { readbackCalls++; return initial, nil }, func() {},
+		); err == nil {
+			t.Fatalf("missing or ineligible target %s was accepted", targetDSID)
+		}
+		if removeCalls != 0 || readbackCalls != 0 {
+			t.Fatalf("preflight failure submitted or read back: remove=%d readback=%d", removeCalls, readbackCalls)
+		}
+	}
+}
+
+func TestRemoveFamilyMemberReferenceNeverReplaysUnknownMutation(t *testing.T) {
+	key := bytes.Repeat([]byte{0x46}, 32)
+	initial := []any{
+		refRosterMember("organizer@example.test", "100", true, false, true),
+		refRosterMember("member@example.test", "200", false, false, false),
+	}
+	ref, _ := familyMemberReference(key, "200")
+	refBytes, _ := decodeFamilyReferenceValue(ref)
+	removeCalls, readbackCalls := 0, 0
+	_, err := removeFamilyMemberReference(initial, "100", key, refBytes,
+		func(string) (bool, bool, error) { removeCalls++; return true, false, errors.New("synthetic timeout") },
+		func() ([]any, error) { readbackCalls++; return initial, nil }, func() {},
+	)
+	if err == nil || removeCalls != 1 || readbackCalls != 4 {
+		t.Fatalf("unknown result did not stop after bounded read-only checks: remove=%d readback=%d err=%v", removeCalls, readbackCalls, err)
+	}
+}
+
+func TestRemoveFamilyMemberReferenceNeverConfirmsExplicitRejectEvenIfTargetDisappears(t *testing.T) {
+	key := bytes.Repeat([]byte{0x41}, 32)
+	initial := []any{
+		refRosterMember("organizer@example.test", "100", true, false, true),
+		refRosterMember("member@example.test", "200", false, false, false),
+	}
+	ref, _ := familyMemberReference(key, "200")
+	refBytes, _ := decodeFamilyReferenceValue(ref)
+	removeCalls, readbackCalls := 0, 0
+	verified, err := removeFamilyMemberReference(initial, "100", key, refBytes,
+		func(string) (bool, bool, error) {
+			removeCalls++
+			return true, true, errors.New("synthetic ec rejection")
+		},
+		func() ([]any, error) {
+			readbackCalls++
+			return []any{initial[0]}, nil
+		}, func() {},
+	)
+	if err == nil || verified != nil || removeCalls != 1 || readbackCalls != 1 {
+		t.Fatalf("explicit rejection was reported as confirmed: verified=%#v remove=%d readback=%d err=%v", verified, removeCalls, readbackCalls, err)
+	}
+}
+
+func TestRemoveFamilyMemberReferenceRequiresRosterCountDecreaseByOne(t *testing.T) {
+	key := bytes.Repeat([]byte{0x52}, 32)
+	initial := []any{
+		refRosterMember("organizer@example.test", "100", true, false, true),
+		refRosterMember("member@example.test", "200", false, false, false),
+	}
+	ref, _ := familyMemberReference(key, "200")
+	refBytes, _ := decodeFamilyReferenceValue(ref)
+	removeCalls, readbackCalls := 0, 0
+	concurrentRoster := []any{
+		initial[0],
+		refRosterMember("other@example.test", "300", false, false, false),
+	}
+	if _, err := removeFamilyMemberReference(initial, "100", key, refBytes,
+		func(string) (bool, bool, error) { removeCalls++; return true, false, nil },
+		func() ([]any, error) { readbackCalls++; return concurrentRoster, nil }, func() {},
+	); err == nil || removeCalls != 1 || readbackCalls != 4 {
+		t.Fatalf("concurrent member-count change was confirmed: remove=%d readback=%d err=%v", removeCalls, readbackCalls, err)
+	}
+}
+
+func TestRemoveFamilyMemberReferenceRejectsPreSubmitAndAmbiguousReadback(t *testing.T) {
+	key := bytes.Repeat([]byte{0x57}, 32)
+	initial := []any{
+		refRosterMember("organizer@example.test", "100", true, false, true),
+		refRosterMember("member@example.test", "200", false, false, false),
+	}
+	ref, _ := familyMemberReference(key, "200")
+	refBytes, _ := decodeFamilyReferenceValue(ref)
+	removeCalls, readbackCalls := 0, 0
+	if _, err := removeFamilyMemberReference(initial, "100", key, refBytes,
+		func(string) (bool, bool, error) {
+			removeCalls++
+			return false, false, errors.New("synthetic pre-submit failure")
+		},
+		func() ([]any, error) { readbackCalls++; return []any{initial[0]}, nil }, func() {},
+	); err == nil || removeCalls != 1 || readbackCalls != 0 {
+		t.Fatalf("pre-submit error was treated as a submitted mutation: remove=%d readback=%d err=%v", removeCalls, readbackCalls, err)
+	}
+	ambiguous := []any{
+		refRosterMember("organizer@example.test", "100", true, false, true),
+		refRosterMember("other@example.test", "100", false, false, false),
+	}
+	if confirmed, err := verifyFamilyMemberReferenceRemoval(ambiguous, "100", "200", 3); err == nil || confirmed {
+		t.Fatal("ambiguous readback incorrectly confirmed removal")
+	}
+}
+
+func TestBuildAndPostFamilyMemberRemovalRequestUsesOrganizerAuthAndV2HeadersOnce(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if r.Method != http.MethodPost || r.URL.Path != "/setup/mac/family/removeFamilyMember" {
+			t.Errorf("unexpected removal route: %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json, text/plist, application/x-plist" {
+			t.Errorf("unexpected content negotiation headers: %#v", r.Header)
+		}
+		if r.Header.Get("Origin") != "https://setup.icloud.com" || r.Header.Get("Referer") != familyMemberRemovalReferer {
+			t.Errorf("unexpected V2 origin headers: %#v", r.Header)
+		}
+		if r.Header.Get("X-Requested-With") != "XMLHttpRequest" || r.Header.Get("X-SproutCore-Version") != "1.6.0" {
+			t.Errorf("missing V2 AJAX headers: %#v", r.Header)
+		}
+		if r.Header.Get("User-Agent") != familyMemberRemovalUserAgent || r.Header.Get("X-MMe-Client-Info") != familyMemberRemovalClientInfo {
+			t.Errorf("unexpected V2 web client headers: %#v", r.Header)
+		}
+		if r.Header.Get("Authorization") != "Basic synthetic-organizer-auth" || r.Header.Get("X-MMe-LoggedIn-AppleID") != "organizer@example.test" || r.Header.Get("X-Apple-I-MD") != "synthetic-anisette" {
+			t.Errorf("organizer authentication or anisette headers were not preserved: %#v", r.Header)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("could not read synthetic request body: %v", err)
+		}
+		var payload map[string]any
+		if json.Unmarshal(body, &payload) != nil || len(payload) != 1 || payload["dsid"] != "987654321" {
+			t.Errorf("unexpected removal JSON body: %s", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ec":0}`)
+	}))
+	defer server.Close()
+
+	organizerRequest := func(endpoint string) (*http.Request, error) {
+		request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("Authorization", "Basic synthetic-organizer-auth")
+		request.Header.Set("X-MMe-LoggedIn-AppleID", "organizer@example.test")
+		request.Header.Set("X-Apple-I-MD", "synthetic-anisette")
+		return request, nil
+	}
+	request, err := buildFamilyMemberRemovalRequest(server.URL+"/setup/mac/family/removeFamilyMember", "987654321", organizerRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removalOutcome := "not_submitted"
+	submitted, explicitlyRejected, err := postFamilyMemberRemoval(server.Client(), request, func() { removalOutcome = "unknown" })
+	if err != nil || !submitted || explicitlyRejected || removalOutcome != "unknown" || requestCount != 1 {
+		t.Fatalf("synthetic V2 removal did not submit exactly once: submitted=%t outcome=%s calls=%d err=%v", submitted, removalOutcome, requestCount, err)
+	}
+}
+
+func TestPostFamilyMemberRemovalDoesNotFollowRedirectsOrReplay(t *testing.T) {
+	firstCalls, redirectCalls := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/remove" {
+			firstCalls++
+			http.Redirect(w, r, "/redirect-target", http.StatusFound)
+			return
+		}
+		if r.URL.Path == "/redirect-target" {
+			redirectCalls++
+		}
+	}))
+	defer server.Close()
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/remove", strings.NewReader(`{"dsid":"200"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitted, explicitlyRejected, err := postFamilyMemberRemoval(server.Client(), request, nil)
+	if err == nil || !submitted || !explicitlyRejected || firstCalls != 1 || redirectCalls != 0 {
+		t.Fatalf("redirect was followed or mutation replayed: submitted=%t first=%d redirected=%d err=%v", submitted, firstCalls, redirectCalls, err)
+	}
+}
+
+func TestFamilyMutationResponseRequiresExplicitSuccessfulEcOrStatus(t *testing.T) {
+	for _, payload := range []map[string]any{
+		{"ec": 0},
+		{"nested": map[string]any{"status": "0"}},
+	} {
+		data, err := json.Marshal(payload)
+		if err != nil || !familyMutationResponseConfirmed(data) {
+			t.Fatalf("explicit zero family response code was rejected: %s err=%v", data, err)
+		}
+	}
+	plistSuccess, err := plist.Marshal(map[string]any{"ec": int64(0)}, plist.XMLFormat)
+	if err != nil || !familyMutationResponseConfirmed(plistSuccess) {
+		t.Fatalf("plist ec=0 family response was rejected: err=%v", err)
+	}
+	plistFailure, err := plist.Marshal(map[string]any{"ec": int64(-1)}, plist.XMLFormat)
+	if err != nil || familyMutationResponseConfirmed(plistFailure) {
+		t.Fatalf("plist nonzero ec was treated as success: err=%v", err)
+	}
+	for _, data := range [][]byte{
+		[]byte(`{"ec":7}`),
+		[]byte(`{"status":"rejected"}`),
+		[]byte(`{"success":true}`),
+		[]byte(`{}`),
+		[]byte(""),
+	} {
+		if familyMutationResponseConfirmed(data) {
+			t.Fatalf("response without explicit successful ec/status was accepted: %s", data)
+		}
+	}
+}
+
+func TestHTTP200WithNonzeroFamilyEcKeepsOutcomeUnknown(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "application/x-plist")
+		_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>ec</key><integer>-1</integer></dict></plist>`)
+	}))
+	defer server.Close()
+	key := bytes.Repeat([]byte{0x69}, 32)
+	initial := []any{
+		refRosterMember("organizer@example.test", "100", true, false, true),
+		refRosterMember("member@example.test", "200", false, false, false),
+	}
+	reference, err := familyMemberReference(key, "200")
+	if err != nil {
+		t.Fatal(err)
+	}
+	referenceBytes, _ := decodeFamilyReferenceValue(reference)
+	previousOutcome := familyRemovalOutcome
+	t.Cleanup(func() { familyRemovalOutcome = previousOutcome })
+	familyRemovalOutcome = "not_submitted"
+	removeCalls, readbackCalls := 0, 0
+	organizerRequest := func(endpoint string) (*http.Request, error) {
+		return http.NewRequest(http.MethodPost, endpoint, nil)
+	}
+	verified, err := removeFamilyMemberReference(initial, "100", key, referenceBytes,
+		func(dsid string) (bool, bool, error) {
+			removeCalls++
+			request, requestErr := buildFamilyMemberRemovalRequest(server.URL+"/remove", dsid, organizerRequest)
+			if requestErr != nil {
+				return false, false, requestErr
+			}
+			return postFamilyMemberRemoval(server.Client(), request, func() { familyRemovalOutcome = "unknown" })
+		},
+		func() ([]any, error) {
+			readbackCalls++
+			// Simulate a concurrent removal: the target is gone and the count fell
+			// by one, but Apple's explicit nonzero ec must still prevent success.
+			return []any{initial[0]}, nil
+		}, func() {},
+	)
+	if err == nil || verified != nil || removeCalls != 1 || readbackCalls != 1 || familyRemovalOutcome != "unknown" || requestCount != 1 {
+		t.Fatalf("HTTP 200 with nonzero plist ec was confirmed or repeated: verified=%#v outcome=%s http=%d remove=%d readback=%d err=%v", verified, familyRemovalOutcome, requestCount, removeCalls, readbackCalls, err)
 	}
 }

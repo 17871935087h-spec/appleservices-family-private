@@ -2,6 +2,9 @@ package v2gateway
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -774,6 +777,351 @@ func TestInterruptedIntentIsRecoveredAsUnknown(t *testing.T) {
 
 func unknownIs(status int, result familyReply) bool {
 	return status == http.StatusOK && !result.OK && result.Stage == "outcome_unknown" && result.Message == safeUnknownMessage
+}
+
+func gatewayMemberRef(value byte) string {
+	return base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{value}, sha256.Size))
+}
+
+func familyRosterFixture(members []familyRosterMember, unidentified, total int) *familyRosterProjection {
+	return &familyRosterProjection{Members: members, UnidentifiedCount: unidentified, TotalCount: total}
+}
+
+func organizerOnlyRegistryFixture() string {
+	return `{"accounts":[{"id":"org-01","name":"organizer","apple_id":"Organizer@Example.test","dir":"D:\\service\\accounts\\org-01"}]}`
+}
+
+func TestFamilyRosterReturnsOnlyValidatedOpaqueMembersAndRequiresRegistry(t *testing.T) {
+	ref := gatewayMemberRef(11)
+	registryPath := testRegistry(t, organizerOnlyRegistryFixture())
+	org := familyFixture(true, true, 3, 1, 1, true, true, true, true, true, true, storage50)
+	projection := familyRosterFixture([]familyRosterMember{{Ref: ref, Label: "m***@example.test"}}, 1, 3)
+	fake := newFakeDashboard(t, func(w http.ResponseWriter, _ *http.Request, call dashboardActionCall) {
+		if call.Account != "org-01" {
+			t.Errorf("roster read used a non-organizer account: %#v", call)
+		}
+		switch call.Action.Action {
+		case "family-info-direct":
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-info", Family: org})
+		case "family-roster":
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-roster", FamilyRoster: projection})
+		default:
+			t.Errorf("unexpected dashboard action: %#v", call)
+		}
+	})
+	g := testGateway(t, fake, registryPath, "", 500*time.Millisecond)
+	response := gatewayRequest(t, g, "/v1/family/roster", `{"account_id":"org-01"}`)
+	result := decodeGatewayResponse[familyRosterReply](t, response)
+	if response.Code != http.StatusOK || !result.OK || result.Stage != "family-roster" || result.TotalCount != 3 || result.UnidentifiedCount != 1 || len(result.Members) != 1 || result.Members[0] != projection.Members[0] {
+		t.Fatalf("unexpected roster response: %d %#v", response.Code, result)
+	}
+	for _, forbidden := range []string{"Organizer@Example.test", "target@example.test", "target-02", "account_id"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("roster response leaked %q: %s", forbidden, response.Body.String())
+		}
+	}
+
+	callsBefore, _ := fake.snapshot()
+	missing := gatewayRequest(t, g, "/v1/family/roster", `{"account_id":"target-02"}`)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("unregistered organizer status = %d, want 404", missing.Code)
+	}
+	callsAfter, _ := fake.snapshot()
+	if len(callsAfter) != len(callsBefore) {
+		t.Fatalf("unregistered account reached dashboard: before=%d after=%d", len(callsBefore), len(callsAfter))
+	}
+}
+
+func TestFamilyRosterStrictlyValidatesRefsLabelsAndCounts(t *testing.T) {
+	ref := gatewayMemberRef(12)
+	valid := familyRosterFixture([]familyRosterMember{{Ref: ref, Label: "m***@example.test"}}, 0, 2)
+	if !validFamilyRoster(valid) {
+		t.Fatal("valid masked roster rejected")
+	}
+	invalid := []*familyRosterProjection{
+		familyRosterFixture([]familyRosterMember{{Ref: ref, Label: "m***@example.test"}, {Ref: ref, Label: "n***@example.test"}}, 0, 3),
+		familyRosterFixture([]familyRosterMember{{Ref: "not-a-reference", Label: "m***@example.test"}}, 0, 2),
+		familyRosterFixture([]familyRosterMember{{Ref: ref, Label: "member@example.test"}}, 0, 2),
+		familyRosterFixture([]familyRosterMember{{Ref: ref, Label: "m***@example.test"}}, 2, 2),
+		familyRosterFixture([]familyRosterMember{{Ref: ref, Label: "m***@example.test"}}, 0, 1),
+		familyRosterFixture(nil, 0, 1),
+		familyRosterFixture([]familyRosterMember{}, -1, 1),
+	}
+	for index, roster := range invalid {
+		if validFamilyRoster(roster) {
+			t.Fatalf("unsafe roster %d was accepted: %#v", index, roster)
+		}
+	}
+}
+
+func TestFamilyRosterRejectsUnknownDashboardMemberFields(t *testing.T) {
+	ref := gatewayMemberRef(20)
+	registryPath := testRegistry(t, organizerOnlyRegistryFixture())
+	org := familyFixture(true, true, 2, 1, 1, true, true, true, true, true, true, storage50)
+	fake := newFakeDashboard(t, func(w http.ResponseWriter, _ *http.Request, call dashboardActionCall) {
+		if call.Action.Action == "family-info-direct" {
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-info", Family: org})
+			return
+		}
+		if call.Action.Action != "family-roster" {
+			t.Errorf("unexpected dashboard action: %#v", call)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true,"stage":"family-roster","family_roster":{"members":[{"ref":"`+ref+`","label":"m***@example.test","dsid":"private-dsid"}],"unidentified_count":0,"total_count":2}}`)
+	})
+	g := testGateway(t, fake, registryPath, "", 500*time.Millisecond)
+	response := gatewayRequest(t, g, "/v1/family/roster", `{"account_id":"org-01"}`)
+	if response.Code != http.StatusBadGateway || strings.Contains(response.Body.String(), ref) || strings.Contains(response.Body.String(), "private-dsid") {
+		t.Fatalf("unknown dashboard roster field was not safely rejected: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestFamilyRemoveByRefUsesOrganizerOnlyAndIsIdempotent(t *testing.T) {
+	ref := gatewayMemberRef(13)
+	registryPath := testRegistry(t, organizerOnlyRegistryFixture())
+	intentDir := filepath.Join(testRoot(t), "remove-ref-journal")
+	orgBefore := familyFixture(true, true, 2, 1, 1, true, true, true, true, true, true, storage50)
+	orgAfter := familyFixture(true, true, 1, 1, 1, true, true, true, true, true, true, storage50)
+	rosterBefore := familyRosterFixture([]familyRosterMember{{Ref: ref, Label: "t***@example.test"}}, 0, 2)
+	rosterAfter := familyRosterFixture([]familyRosterMember{}, 0, 1)
+	mutations := 0
+	reads := map[string]int{}
+	var mu sync.Mutex
+	fake := newFakeDashboard(t, func(w http.ResponseWriter, _ *http.Request, call dashboardActionCall) {
+		if call.Account != "org-01" {
+			t.Errorf("family removal used a non-organizer account: %#v", call)
+		}
+		switch call.Action.Action {
+		case "family-roster":
+			mu.Lock()
+			reads["roster"]++
+			count := reads["roster"]
+			mu.Unlock()
+			projection := rosterBefore
+			if count > 1 {
+				projection = rosterAfter
+			}
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-roster", FamilyRoster: projection})
+		case "family-info-direct":
+			mu.Lock()
+			reads["family"]++
+			count := reads["family"]
+			mu.Unlock()
+			family := orgBefore
+			if count > 1 {
+				family = orgAfter
+			}
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-info", Family: family})
+		case "family-remove-ref":
+			mutations++
+			if call.Action.Code != ref {
+				t.Errorf("remove did not forward the selected opaque ref: %#v", call)
+			}
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-member-removed", Family: orgAfter})
+		default:
+			t.Errorf("unexpected dashboard action: %#v", call)
+		}
+	})
+	g := testGateway(t, fake, registryPath, intentDir, 500*time.Millisecond)
+	requestBody, _ := json.Marshal(familyRemoveRefRequest{OrganizerAccountID: "org-01", MemberRef: ref, OperationID: "remove-ref-001"})
+	response := gatewayRequest(t, g, "/v1/family/remove-by-ref", string(requestBody))
+	removed := decodeGatewayResponse[familyReply](t, response)
+	if response.Code != http.StatusOK || !removed.OK || removed.Stage != "family-member-removed" || removed.Family == nil || removed.Family.Members != 1 {
+		t.Fatalf("unexpected remove-by-ref response: %d %#v", response.Code, removed)
+	}
+	duplicate := gatewayRequest(t, g, "/v1/family/remove-by-ref", string(requestBody))
+	if duplicate.Code != http.StatusOK || !decodeGatewayResponse[familyReply](t, duplicate).OK {
+		t.Fatalf("operation replay did not return the saved result: %d %s", duplicate.Code, duplicate.Body.String())
+	}
+	wrongRef := gatewayMemberRef(14)
+	conflictBody, _ := json.Marshal(familyRemoveRefRequest{OrganizerAccountID: "org-01", MemberRef: wrongRef, OperationID: "remove-ref-001"})
+	conflict := gatewayRequest(t, g, "/v1/family/remove-by-ref", string(conflictBody))
+	if conflict.Code != http.StatusConflict || !strings.Contains(conflict.Body.String(), "operation-id-conflict") {
+		t.Fatalf("operation id accepted a different member ref: %d %s", conflict.Code, conflict.Body.String())
+	}
+	calls, _ := fake.snapshot()
+	if mutations != 1 || len(calls) != 5 {
+		t.Fatalf("dashboard calls = %d, mutations = %d; want 5 calls and one submission", len(calls), mutations)
+	}
+	wantActions := []string{"family-roster", "family-info-direct", "family-remove-ref", "family-roster", "family-info-direct"}
+	for index, want := range wantActions {
+		if calls[index].Action.Action != want || calls[index].Account != "org-01" {
+			t.Fatalf("dashboard call %d = %#v, want organizer action %s", index, calls[index], want)
+		}
+	}
+	record, ok := g.journal.lookup("remove-ref-001")
+	if !ok || record.Action != "family-remove-ref" || record.TargetAccountID != familyMemberRefHash(ref) || record.State != stateSucceeded {
+		t.Fatalf("journal did not retain the hashed target identity: %#v", record)
+	}
+	entries, err := os.ReadDir(intentDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("remove-ref journal entries = %d, err=%v", len(entries), err)
+	}
+	journalBytes, err := os.ReadFile(filepath.Join(intentDir, entries[0].Name()))
+	if err != nil || bytes.Contains(journalBytes, []byte(ref)) || bytes.Contains(journalBytes, []byte("target-02")) || bytes.Contains(journalBytes, []byte("target@example.test")) {
+		t.Fatalf("journal retained raw target identity: err=%v", err)
+	}
+}
+
+func TestFamilyRemoveByRefDoesNotRequireUnchangedStorageMetadata(t *testing.T) {
+	ref := gatewayMemberRef(21)
+	before := familyFixture(true, true, 2, 1, 1, true, true, true, true, true, true, storage50)
+	after := familyFixture(true, true, 1, 1, 1, true, true, false, false, false, false, 0)
+	beforeRoster := familyRosterFixture([]familyRosterMember{{Ref: ref, Label: "t***@example.test"}}, 0, 2)
+	afterRoster := familyRosterFixture([]familyRosterMember{}, 0, 1)
+	fake := newFakeDashboard(t, func(w http.ResponseWriter, _ *http.Request, call dashboardActionCall) {
+		switch call.Action.Action {
+		case "family-roster":
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-roster", FamilyRoster: afterRoster})
+		case "family-info-direct":
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-info", Family: after})
+		default:
+			t.Fatalf("unexpected dashboard action: %s", call.Action.Action)
+		}
+	})
+	g := testGateway(t, fake, testRegistry(t, organizerOnlyRegistryFixture()), "", 500*time.Millisecond)
+	result := dashboardResult{OK: true, Stage: "family-member-removed", Family: after}
+	if verified := g.verifyRemovedByRef(context.Background(), "org-01", ref, before, beforeRoster, result); verified == nil || verified.Members != 1 {
+		t.Fatal("the verified target disappearance must not depend on unrelated storage metadata")
+	}
+}
+
+func TestFamilyRemoveByRefRequiresOrganizerRoleAndExactRosterIdentity(t *testing.T) {
+	ref := gatewayMemberRef(15)
+	registryPath := testRegistry(t, organizerOnlyRegistryFixture())
+	wrongRole := familyFixture(true, false, 2, 1, 1, true, true, true, true, true, true, storage50)
+	mutations := 0
+	fake := newFakeDashboard(t, func(w http.ResponseWriter, _ *http.Request, call dashboardActionCall) {
+		switch call.Action.Action {
+		case "family-roster":
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-roster", FamilyRoster: familyRosterFixture([]familyRosterMember{{Ref: ref, Label: "c***@example.test"}}, 0, 2)})
+		case "family-info-direct":
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-info", Family: wrongRole})
+		case "family-remove-ref":
+			mutations++
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-member-removed", Family: wrongRole})
+		default:
+			t.Errorf("unexpected dashboard action: %#v", call)
+		}
+	})
+	intentDir := filepath.Join(testRoot(t), "remove-ref-role-journal")
+	g := testGateway(t, fake, registryPath, intentDir, 500*time.Millisecond)
+	body, _ := json.Marshal(familyRemoveRefRequest{OrganizerAccountID: "org-01", MemberRef: ref, OperationID: "remove-ref-role-001"})
+	response := gatewayRequest(t, g, "/v1/family/remove-by-ref", string(body))
+	if response.Code != http.StatusConflict || decodeGatewayResponse[familyReply](t, response).Stage != "family-preflight" || mutations != 0 {
+		t.Fatalf("non-organizer reached removal: status=%d body=%s mutations=%d", response.Code, response.Body.String(), mutations)
+	}
+	entries, err := os.ReadDir(intentDir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("failed organizer precondition persisted intent: entries=%d err=%v", len(entries), err)
+	}
+
+	// A ref absent from the exact live organizer roster must not create an intent
+	// or reach the dashboard write action.
+	wrongRef := gatewayMemberRef(16)
+	body, _ = json.Marshal(familyRemoveRefRequest{OrganizerAccountID: "org-01", MemberRef: wrongRef, OperationID: "remove-ref-absent-001"})
+	response = gatewayRequest(t, g, "/v1/family/remove-by-ref", string(body))
+	if response.Code != http.StatusConflict || decodeGatewayResponse[familyReply](t, response).Stage != "family-preflight" || mutations != 0 {
+		t.Fatalf("absent ref reached removal: status=%d body=%s mutations=%d", response.Code, response.Body.String(), mutations)
+	}
+}
+
+func TestFamilyRemoveByRefKnownNotSubmittedIsSafeAndIdempotent(t *testing.T) {
+	ref := gatewayMemberRef(17)
+	registryPath := testRegistry(t, organizerOnlyRegistryFixture())
+	org := familyFixture(true, true, 2, 1, 1, true, true, true, true, true, true, storage50)
+	projection := familyRosterFixture([]familyRosterMember{{Ref: ref, Label: "c***@example.test"}}, 0, 2)
+	mutations := 0
+	fake := newFakeDashboard(t, func(w http.ResponseWriter, _ *http.Request, call dashboardActionCall) {
+		switch call.Action.Action {
+		case "family-roster":
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-roster", FamilyRoster: projection})
+		case "family-info-direct":
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-info", Family: org})
+		case "family-remove-ref":
+			mutations++
+			writeDashboardResult(w, dashboardResult{OK: false, Stage: "family-remove-preflight"})
+		default:
+			t.Errorf("unexpected dashboard action: %#v", call)
+		}
+	})
+	intentDir := filepath.Join(testRoot(t), "remove-ref-not-submitted-journal")
+	g := testGateway(t, fake, registryPath, intentDir, 500*time.Millisecond)
+	requestFor := func(operationID string) string {
+		data, _ := json.Marshal(familyRemoveRefRequest{OrganizerAccountID: "org-01", MemberRef: ref, OperationID: operationID})
+		return string(data)
+	}
+	first := gatewayRequest(t, g, "/v1/family/remove-by-ref", requestFor("remove-ref-preflight-001"))
+	firstReply := decodeGatewayResponse[familyReply](t, first)
+	if first.Code != http.StatusConflict || firstReply.OK || firstReply.Stage != "family-remove-preflight" {
+		t.Fatalf("known not-submitted result was not preserved: %d %#v", first.Code, firstReply)
+	}
+	record, ok := g.journal.lookup("remove-ref-preflight-001")
+	if !ok || record.State != stateNotSubmitted || g.journal.isBlocked("org-01") {
+		t.Fatalf("known not-submitted outcome incorrectly blocked organizer: record=%#v blocked=%v", record, g.journal.isBlocked("org-01"))
+	}
+	replay := gatewayRequest(t, g, "/v1/family/remove-by-ref", requestFor("remove-ref-preflight-001"))
+	if replay.Code != http.StatusOK || decodeGatewayResponse[familyReply](t, replay).Stage != "family-remove-preflight" {
+		t.Fatalf("known not-submitted result was not idempotent: %d %s", replay.Code, replay.Body.String())
+	}
+	second := gatewayRequest(t, g, "/v1/family/remove-by-ref", requestFor("remove-ref-preflight-002"))
+	if second.Code != http.StatusConflict || decodeGatewayResponse[familyReply](t, second).Stage != "family-remove-preflight" || mutations != 2 {
+		t.Fatalf("known not-submitted outcome blocked a new explicit operation: %d %s mutations=%d", second.Code, second.Body.String(), mutations)
+	}
+}
+
+func TestFamilyRemoveByRefUnknownOutcomeBlocksAfterRestart(t *testing.T) {
+	ref := gatewayMemberRef(18)
+	registryPath := testRegistry(t, organizerOnlyRegistryFixture())
+	intentDir := filepath.Join(testRoot(t), "remove-ref-unknown-journal")
+	org := familyFixture(true, true, 2, 1, 1, true, true, true, true, true, true, storage50)
+	projection := familyRosterFixture([]familyRosterMember{{Ref: ref, Label: "c***@example.test"}}, 0, 2)
+	mutations := 0
+	fake := newFakeDashboard(t, func(w http.ResponseWriter, _ *http.Request, call dashboardActionCall) {
+		switch call.Action.Action {
+		case "family-roster":
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-roster", FamilyRoster: projection})
+		case "family-info-direct":
+			writeDashboardResult(w, dashboardResult{OK: true, Stage: "family-info", Family: org})
+		case "family-remove-ref":
+			mutations++
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, "private target@example.test dsid=private-dsid")
+		default:
+			t.Errorf("unexpected dashboard action: %#v", call)
+		}
+	})
+	g := testGateway(t, fake, registryPath, intentDir, 500*time.Millisecond)
+	requestBody := `{"organizer_account_id":"org-01","member_ref":"` + ref + `","operation_id":"remove-ref-unknown-001"}`
+	response := gatewayRequest(t, g, "/v1/family/remove-by-ref", requestBody)
+	unknown := decodeGatewayResponse[familyReply](t, response)
+	if !unknownIs(response.Code, unknown) {
+		t.Fatalf("failed mutation was not outcome_unknown: %d %#v", response.Code, unknown)
+	}
+	for _, secret := range []string{ref, "target@example.test", "private-dsid"} {
+		if strings.Contains(response.Body.String(), secret) {
+			t.Fatalf("unknown response leaked %q: %s", secret, response.Body.String())
+		}
+	}
+	callsBeforeReplay, _ := fake.snapshot()
+	replay := gatewayRequest(t, g, "/v1/family/remove-by-ref", requestBody)
+	if replay.Code != http.StatusOK || decodeGatewayResponse[familyReply](t, replay).Stage != "outcome_unknown" {
+		t.Fatalf("unknown operation replay was not stable: %d %s", replay.Code, replay.Body.String())
+	}
+	secondGateway := testGateway(t, fake, registryPath, intentDir, 500*time.Millisecond)
+	blocked := gatewayRequest(t, secondGateway, "/v1/family/remove-by-ref", `{"organizer_account_id":"org-01","member_ref":"`+gatewayMemberRef(19)+`","operation_id":"remove-ref-unknown-002"}`)
+	if blocked.Code != http.StatusConflict || decodeGatewayResponse[familyReply](t, blocked).Stage != "outcome_unknown" {
+		t.Fatalf("restart did not retain organizer block: %d %s", blocked.Code, blocked.Body.String())
+	}
+	callsAfterRestartAttempt, _ := fake.snapshot()
+	if mutations != 1 || len(callsAfterRestartAttempt) != len(callsBeforeReplay) {
+		t.Fatalf("unknown result was retried: mutations=%d calls-before=%d calls-after=%d", mutations, len(callsBeforeReplay), len(callsAfterRestartAttempt))
+	}
+	record, ok := secondGateway.journal.lookup("remove-ref-unknown-001")
+	if !ok || record.State != stateUnknown || record.TargetAccountID != familyMemberRefHash(ref) {
+		t.Fatalf("restart did not retain opaque target hash and unknown state: %#v", record)
+	}
 }
 
 func TestGatewayRejectsCookieOriginAndOversizedInput(t *testing.T) {

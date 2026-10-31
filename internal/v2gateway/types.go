@@ -17,6 +17,7 @@ const (
 	maxCredentialRequestBytes = 16 << 10
 	maxRegistryBytes          = 256 << 10
 	maxResponseBytes          = 1 << 20
+	maxFamilyRosterMembers    = 20
 )
 
 var (
@@ -74,6 +75,26 @@ type familyPoolReply struct {
 	TotalCount    int                `json:"total_count"`
 }
 
+type familyRosterMember struct {
+	Ref   string `json:"ref"`
+	Label string `json:"label"`
+}
+
+type familyRosterProjection struct {
+	Members           []familyRosterMember `json:"members"`
+	UnidentifiedCount int                  `json:"unidentified_count"`
+	TotalCount        int                  `json:"total_count"`
+}
+
+type familyRosterReply struct {
+	OK                bool                 `json:"ok"`
+	Stage             string               `json:"stage"`
+	Message           string               `json:"message"`
+	Members           []familyRosterMember `json:"members"`
+	UnidentifiedCount int                  `json:"unidentified_count"`
+	TotalCount        int                  `json:"total_count"`
+}
+
 type resolveRequest struct {
 	AppleID string `json:"apple_id"`
 }
@@ -90,6 +111,12 @@ type accountRequest struct {
 type mutationRequest struct {
 	OrganizerAccountID string `json:"organizer_account_id"`
 	TargetAccountID    string `json:"target_account_id"`
+	OperationID        string `json:"operation_id"`
+}
+
+type familyRemoveRefRequest struct {
+	OrganizerAccountID string `json:"organizer_account_id"`
+	MemberRef          string `json:"member_ref"`
 	OperationID        string `json:"operation_id"`
 }
 

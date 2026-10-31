@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -26,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	appleservices "github.com/Laky-64/appleservices"
 	"github.com/Laky-64/appleservices/gsa"
@@ -52,6 +54,40 @@ type familyInviteCheckpoint struct {
 
 const safeFamilyStatusPrefix = "FAMILY_STATUS_JSON="
 const safeFamilyPoolPrefix = "FAMILY_POOL_JSON="
+const safeFamilyRosterPrefix = "FAMILY_ROSTER_JSON="
+const familyRemovalOutcomePrefix = "FAMILY_REMOVE_OUTCOME="
+
+const familyRefKeyEnv = "APPLESERVICES_FAMILY_REF_KEY"
+const familyMemberRefEnv = "APPLESERVICES_FAMILY_MEMBER_REF"
+const familyMemberRefDomain = "appleservices-family-member-ref-v1\x00"
+const familyMemberRemovalURL = "https://setup.icloud.com/setup/mac/family/removeFamilyMember"
+const familyMemberRemovalReferer = "https://setup.icloud.com/setup/mac/family/addFamilyMemberUI"
+const familyMemberRemovalUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10) AppleWebKit/600.1.3 (KHTML, like Gecko)"
+const familyMemberRemovalClientInfo = "<MacBook Pro> <Mac OS X;10.10.0;14A314h> <webclient/731eb0905570 (com.apple.systempreferences/14.0)>"
+
+var suppressSensitiveFamilyErrors bool
+var familyRemovalOutcomeEnabled bool
+var familyRemovalOutcome string
+
+type familyRosterMemberRef struct {
+	Ref   string `json:"ref"`
+	Label string `json:"label"`
+}
+
+type familyRosterProjection struct {
+	Members           []familyRosterMemberRef `json:"members"`
+	UnidentifiedCount int                     `json:"unidentified_count"`
+	TotalCount        int                     `json:"total_count"`
+}
+
+type familyReferenceInputs struct {
+	Key        []byte
+	MemberRef  []byte
+	KeyPresent bool
+	RefPresent bool
+	KeyValid   bool
+	RefValid   bool
+}
 
 type familyPoolMember struct {
 	AccountID string `json:"account_id"`
@@ -167,6 +203,513 @@ func numericIDValue(v any) string {
 		return ""
 	}
 	return value
+}
+
+func decodeFamilyReferenceValue(value string) ([]byte, bool) {
+	if value == "" || strings.Contains(value, "=") {
+		return nil, false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil || len(decoded) != sha256.Size || base64.RawURLEncoding.EncodeToString(decoded) != value {
+		for index := range decoded {
+			decoded[index] = 0
+		}
+		return nil, false
+	}
+	return decoded, true
+}
+
+// consumeFamilyReferenceInputs removes the one-shot selection material from
+// the process environment before decoding it. Neither value is ever logged.
+func consumeFamilyReferenceInputs() familyReferenceInputs {
+	keyValue := os.Getenv(familyRefKeyEnv)
+	_ = os.Unsetenv(familyRefKeyEnv)
+	refValue := os.Getenv(familyMemberRefEnv)
+	_ = os.Unsetenv(familyMemberRefEnv)
+
+	inputs := familyReferenceInputs{KeyPresent: keyValue != "", RefPresent: refValue != ""}
+	if inputs.KeyPresent {
+		inputs.Key, inputs.KeyValid = decodeFamilyReferenceValue(keyValue)
+	}
+	if inputs.RefPresent {
+		inputs.MemberRef, inputs.RefValid = decodeFamilyReferenceValue(refValue)
+	}
+	keyValue, refValue = "", ""
+	return inputs
+}
+
+func clearFamilyReferenceInputs(inputs *familyReferenceInputs) {
+	if inputs == nil {
+		return
+	}
+	for index := range inputs.Key {
+		inputs.Key[index] = 0
+	}
+	for index := range inputs.MemberRef {
+		inputs.MemberRef[index] = 0
+	}
+	inputs.Key, inputs.MemberRef = nil, nil
+}
+
+func canonicalFamilyMemberDSID(value any) string {
+	dsid := numericIDValue(value)
+	if dsid == "" || len(dsid) > 64 {
+		return ""
+	}
+	dsid = strings.TrimLeft(dsid, "0")
+	if dsid == "" {
+		return ""
+	}
+	return dsid
+}
+
+func familyMemberReferenceDigest(key []byte, dsid string) ([]byte, error) {
+	if len(key) != 32 || canonicalFamilyMemberDSID(dsid) != dsid {
+		return nil, errors.New("family member reference inputs are invalid")
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(familyMemberRefDomain))
+	_, _ = mac.Write([]byte(dsid))
+	return mac.Sum(nil), nil
+}
+
+func familyMemberReference(key []byte, dsid string) (string, error) {
+	digest, err := familyMemberReferenceDigest(key, dsid)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(digest), nil
+}
+
+func maskedFamilyAppleID(value string) string {
+	local, domain, found := strings.Cut(value, "@")
+	if !found || local == "" || domain == "" {
+		return ""
+	}
+	runes := []rune(local)
+	if len(runes) == 0 || runes[0] == utf8.RuneError {
+		return ""
+	}
+	var masked string
+	switch {
+	case len(runes) >= 8:
+		masked = string(runes[:2]) + "***" + string(runes[len(runes)-2:])
+	case len(runes) >= 3:
+		masked = string(runes[:1]) + "***" + string(runes[len(runes)-1:])
+	default:
+		masked = string(runes[:1]) + "***"
+	}
+	return masked + "@" + domain
+}
+
+type parsedFamilyReferenceMember struct {
+	member         map[string]any
+	dsid           string
+	appleID        string
+	identityKnown  bool
+	organizer      bool
+	organizerKnown bool
+	child          bool
+	childKnown     bool
+	self           bool
+	selfKnown      bool
+}
+
+func parseFamilyReferenceMembers(members []any) []parsedFamilyReferenceMember {
+	parsed := make([]parsedFamilyReferenceMember, len(members))
+	for index, raw := range members {
+		member, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		parsed[index].member = member
+		parsed[index].dsid = canonicalFamilyMemberDSID(member["member-dsid"])
+		parsed[index].appleID, parsed[index].identityKnown = familyPoolMemberIdentity(member)
+		parsed[index].organizer, parsed[index].organizerKnown = member["member-is-organizer"].(bool)
+		parsed[index].child, parsed[index].childKnown = member["member-is-child-account"].(bool)
+		if value, exists := member["is-me"]; exists {
+			parsed[index].self, parsed[index].selfKnown = value.(bool)
+		} else {
+			parsed[index].selfKnown = true
+		}
+	}
+	return parsed
+}
+
+func validateCurrentFamilyOrganizer(parsed []parsedFamilyReferenceMember, currentDSID string, strictMemberIDs bool) error {
+	currentDSID = canonicalFamilyMemberDSID(currentDSID)
+	if currentDSID == "" || len(parsed) == 0 {
+		return errors.New("current family organizer is unavailable")
+	}
+	dsidCounts := make(map[string]int, len(parsed))
+	currentIndexes := make([]int, 0, 1)
+	organizerCount := 0
+	for index, item := range parsed {
+		if item.member == nil {
+			if strictMemberIDs {
+				return errors.New("current family roster is ambiguous")
+			}
+			continue
+		}
+		if item.dsid != "" {
+			dsidCounts[item.dsid]++
+			if item.dsid == currentDSID {
+				currentIndexes = append(currentIndexes, index)
+			}
+		} else if strictMemberIDs {
+			return errors.New("current family roster is ambiguous")
+		}
+		if item.organizerKnown && item.organizer {
+			organizerCount++
+		}
+		if item.selfKnown && item.self && item.dsid != currentDSID {
+			return errors.New("current family member identity is ambiguous")
+		}
+	}
+	if strictMemberIDs {
+		for _, count := range dsidCounts {
+			if count != 1 {
+				return errors.New("current family roster is ambiguous")
+			}
+		}
+	}
+	if len(currentIndexes) != 1 || dsidCounts[currentDSID] != 1 || organizerCount != 1 {
+		return errors.New("current family organizer is ambiguous")
+	}
+	current := parsed[currentIndexes[0]]
+	if !current.organizerKnown || !current.organizer || !current.childKnown || current.child || !current.selfKnown {
+		return errors.New("current family organizer role is unavailable")
+	}
+	if _, explicitlyMarkedSelf := current.member["is-me"]; explicitlyMarkedSelf && !current.self {
+		return errors.New("current family organizer identity is ambiguous")
+	}
+	return nil
+}
+
+func projectFamilyReferenceRoster(members []any, currentDSID string, key []byte) (familyRosterProjection, map[string]string, error) {
+	projection := familyRosterProjection{Members: make([]familyRosterMemberRef, 0), TotalCount: len(members)}
+	if len(key) != 32 {
+		return familyRosterProjection{}, nil, errors.New("family reference key is unavailable")
+	}
+	parsed := parseFamilyReferenceMembers(members)
+	if err := validateCurrentFamilyOrganizer(parsed, currentDSID, false); err != nil {
+		return familyRosterProjection{}, nil, err
+	}
+	dsidCounts := make(map[string]int, len(parsed))
+	appleIDCounts := make(map[string]int, len(parsed))
+	for _, item := range parsed {
+		if item.dsid != "" {
+			dsidCounts[item.dsid]++
+		}
+		if item.identityKnown {
+			appleIDCounts[item.appleID]++
+		}
+	}
+	currentDSID = canonicalFamilyMemberDSID(currentDSID)
+	type candidate struct {
+		row  familyRosterMemberRef
+		dsid string
+	}
+	candidates := make([]candidate, 0, len(parsed))
+	for _, item := range parsed {
+		if item.member == nil {
+			projection.UnidentifiedCount++
+			continue
+		}
+		if item.dsid == "" || dsidCounts[item.dsid] != 1 {
+			projection.UnidentifiedCount++
+			continue
+		}
+		if item.dsid == currentDSID {
+			continue
+		}
+		if !item.organizerKnown || !item.childKnown || !item.selfKnown || !item.identityKnown {
+			projection.UnidentifiedCount++
+			continue
+		}
+		if item.self {
+			projection.UnidentifiedCount++
+			continue
+		}
+		if item.organizer || item.child {
+			continue
+		}
+		if appleIDCounts[item.appleID] != 1 {
+			projection.UnidentifiedCount++
+			continue
+		}
+		label := maskedFamilyAppleID(item.appleID)
+		if label == "" {
+			projection.UnidentifiedCount++
+			continue
+		}
+		digest, err := familyMemberReferenceDigest(key, item.dsid)
+		if err != nil {
+			projection.UnidentifiedCount++
+			continue
+		}
+		candidates = append(candidates, candidate{
+			row:  familyRosterMemberRef{Ref: base64.RawURLEncoding.EncodeToString(digest), Label: label},
+			dsid: item.dsid,
+		})
+	}
+	refCounts, labelCounts := make(map[string]int, len(candidates)), make(map[string]int, len(candidates))
+	for _, item := range candidates {
+		refCounts[item.row.Ref]++
+		labelCounts[item.row.Label]++
+	}
+	resolved := make(map[string]string, len(candidates))
+	for _, item := range candidates {
+		if refCounts[item.row.Ref] != 1 || labelCounts[item.row.Label] != 1 {
+			projection.UnidentifiedCount++
+			continue
+		}
+		projection.Members = append(projection.Members, item.row)
+		resolved[item.row.Ref] = item.dsid
+	}
+	return projection, resolved, nil
+}
+
+func resolveFamilyMemberReference(members []any, currentDSID string, key, reference []byte) (string, error) {
+	if len(reference) != sha256.Size {
+		return "", errors.New("family member reference is invalid")
+	}
+	_, byReference, err := projectFamilyReferenceRoster(members, currentDSID, key)
+	if err != nil {
+		return "", err
+	}
+	match := ""
+	matches := 0
+	for encodedRef, dsid := range byReference {
+		candidateRef, decodeErr := base64.RawURLEncoding.DecodeString(encodedRef)
+		if decodeErr == nil && subtle.ConstantTimeCompare(candidateRef, reference) == 1 {
+			match = dsid
+			matches++
+		}
+		for index := range candidateRef {
+			candidateRef[index] = 0
+		}
+	}
+	if matches != 1 || match == "" {
+		return "", errors.New("family member reference does not match the current roster")
+	}
+	return match, nil
+}
+
+func verifyFamilyMemberReferenceRemoval(members []any, currentDSID, targetDSID string, submittedMemberCount int) (bool, error) {
+	if submittedMemberCount < 2 || len(members) != submittedMemberCount-1 {
+		return false, nil
+	}
+	parsed := parseFamilyReferenceMembers(members)
+	if err := validateCurrentFamilyOrganizer(parsed, currentDSID, true); err != nil {
+		return false, err
+	}
+	targetDSID = canonicalFamilyMemberDSID(targetDSID)
+	if targetDSID == "" {
+		return false, errors.New("family member removal target is invalid")
+	}
+	for _, item := range parsed {
+		if item.dsid == targetDSID {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func buildFamilyMemberRemovalRequest(endpoint, dsid string, organizerRequest func(string) (*http.Request, error)) (*http.Request, error) {
+	dsid = canonicalFamilyMemberDSID(dsid)
+	if dsid == "" || organizerRequest == nil {
+		return nil, errors.New("family member removal request is unavailable")
+	}
+	request, err := organizerRequest(endpoint)
+	if err != nil || request == nil {
+		return nil, errors.New("family member removal request is unavailable")
+	}
+	body, err := json.Marshal(struct {
+		DSID string `json:"dsid"`
+	}{DSID: dsid})
+	if err != nil {
+		return nil, errors.New("family member removal request is invalid")
+	}
+	request.Method = http.MethodPost
+	request.Body = io.NopCloser(bytes.NewReader(body))
+	request.ContentLength = int64(len(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/plist, application/x-plist")
+	request.Header.Set("Origin", "https://setup.icloud.com")
+	request.Header.Set("Referer", familyMemberRemovalReferer)
+	request.Header.Set("X-Requested-With", "XMLHttpRequest")
+	request.Header.Set("X-SproutCore-Version", "1.6.0")
+	request.Header.Set("User-Agent", familyMemberRemovalUserAgent)
+	request.Header.Set("X-MMe-Client-Info", familyMemberRemovalClientInfo)
+	return request, nil
+}
+
+func familyResponseCodeIsZero(value any) (bool, bool) {
+	switch code := value.(type) {
+	case int:
+		return code == 0, true
+	case int8:
+		return code == 0, true
+	case int16:
+		return code == 0, true
+	case int32:
+		return code == 0, true
+	case int64:
+		return code == 0, true
+	case uint:
+		return code == 0, true
+	case uint8:
+		return code == 0, true
+	case uint16:
+		return code == 0, true
+	case uint32:
+		return code == 0, true
+	case uint64:
+		return code == 0, true
+	case float64:
+		return code == 0 && code == math.Trunc(code), true
+	case float32:
+		return code == 0 && float32(math.Trunc(float64(code))) == code, true
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(code), 10, 64)
+		if err == nil {
+			return parsed == 0, true
+		}
+		unsigned, unsignedErr := strconv.ParseUint(strings.TrimSpace(code), 10, 64)
+		if unsignedErr == nil {
+			return unsigned == 0, true
+		}
+	}
+	return false, false
+}
+
+func familyMutationResponseCodeState(value any) (foundCode, allCodesZero, explicitReject bool) {
+	allCodesZero = true
+	var visit func(any)
+	visit = func(current any) {
+		switch item := current.(type) {
+		case map[string]any:
+			for key, child := range item {
+				normalized := normalizedFamilyKey(key)
+				if normalized == "ec" || normalized == "status" {
+					foundCode = true
+					if zero, valid := familyResponseCodeIsZero(child); !valid {
+						allCodesZero = false
+						if status, ok := child.(string); ok {
+							status = strings.ToLower(strings.TrimSpace(status))
+							if strings.Contains(status, "error") || strings.Contains(status, "reject") || strings.Contains(status, "fail") || strings.Contains(status, "denied") || strings.Contains(status, "invalid") {
+								explicitReject = true
+							}
+						}
+					} else if !zero {
+						allCodesZero = false
+						explicitReject = true
+					}
+				}
+				visit(child)
+			}
+		case []any:
+			for _, child := range item {
+				visit(child)
+			}
+		}
+	}
+	visit(value)
+	return foundCode, allCodesZero, explicitReject
+}
+
+func familyMutationResponseState(data []byte) (confirmed, explicitlyRejected bool) {
+	values, err := decodeObject(data)
+	if err != nil {
+		return false, false
+	}
+	if familyResponseError(values) {
+		return false, true
+	}
+	foundCode, allCodesZero, codeReject := familyMutationResponseCodeState(values)
+	if codeReject {
+		return false, true
+	}
+	return foundCode && allCodesZero, false
+}
+
+func familyMutationResponseConfirmed(data []byte) bool {
+	confirmed, _ := familyMutationResponseState(data)
+	return confirmed
+}
+
+// postFamilyMemberRemoval makes one HTTP attempt. It disables redirects even
+// when a test or future caller supplies a client with default redirect policy.
+func postFamilyMemberRemoval(client *http.Client, request *http.Request, beforeSubmit func()) (submitted, explicitlyRejected bool, err error) {
+	if client == nil || request == nil {
+		return false, false, errors.New("family member removal request is unavailable")
+	}
+	oneShotClient := *client
+	oneShotClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if beforeSubmit != nil {
+		beforeSubmit()
+	}
+	response, err := oneShotClient.Do(request)
+	if response != nil {
+		defer response.Body.Close()
+	}
+	if err != nil {
+		return true, false, errors.New("family member removal transport outcome is unknown")
+	}
+	data, readErr := io.ReadAll(io.LimitReader(response.Body, (2<<20)+1))
+	if readErr != nil || len(data) > 2<<20 {
+		return true, false, errors.New("family member removal response is invalid")
+	}
+	if response.StatusCode != http.StatusOK {
+		return true, true, errors.New("family member removal did not return HTTP 200")
+	}
+	confirmed, rejected := familyMutationResponseState(data)
+	if rejected {
+		return true, true, errors.New("family member removal response explicitly rejected the request")
+	}
+	if !confirmed {
+		return true, false, errors.New("family member removal response did not confirm success")
+	}
+	return true, false, nil
+}
+
+// removeFamilyMemberReference calls the mutation callback once at most. It
+// may repeat only bounded read-only roster checks after the submitted request.
+func removeFamilyMemberReference(members []any, currentDSID string, key, reference []byte, removeOnce func(string) (bool, bool, error), readback func() ([]any, error), pause func()) ([]any, error) {
+	targetDSID, err := resolveFamilyMemberReference(members, currentDSID, key, reference)
+	if err != nil {
+		return nil, err
+	}
+	if removeOnce == nil || readback == nil {
+		return nil, errors.New("family member removal is unavailable")
+	}
+	submitted, explicitlyRejected, submitErr := removeOnce(targetDSID)
+	if !submitted {
+		return nil, errors.New("family member removal was not submitted")
+	}
+	if explicitlyRejected {
+		if verifiedMembers, readErr := readback(); readErr == nil {
+			_, _ = verifyFamilyMemberReferenceRemoval(verifiedMembers, currentDSID, targetDSID, len(members))
+		}
+		return nil, errors.New("family member removal was explicitly rejected; automatic retry is unsafe")
+	}
+	for attempt := 0; attempt < 4; attempt++ {
+		verifiedMembers, readErr := readback()
+		if readErr == nil {
+			confirmed, verifyErr := verifyFamilyMemberReferenceRemoval(verifiedMembers, currentDSID, targetDSID, len(members))
+			if verifyErr == nil && confirmed {
+				return verifiedMembers, nil
+			}
+		}
+		if attempt < 3 && pause != nil {
+			pause()
+		}
+	}
+	if submitErr != nil {
+		return nil, errors.New("family member removal outcome is unknown; automatic retry is unsafe")
+	}
+	return nil, errors.New("family member removal was not confirmed; automatic retry is unsafe")
 }
 
 func boolValue(v any) bool {
@@ -631,6 +1174,8 @@ func safeFamilyActionIdentifiers(data []byte) []string {
 }
 
 func run() error {
+	referenceInputs := consumeFamilyReferenceInputs()
+	defer clearFamilyReferenceInputs(&referenceInputs)
 	dir := flag.String("dir", "", "bound account directory")
 	registryPath := flag.String("registry", "", "dashboard accounts.json path required for pool projection")
 	poolProjectionOnly := flag.Bool("pool-projection", false, "read-only exact FamilyKit member projection for local dashboard accounts")
@@ -650,14 +1195,38 @@ func run() error {
 	joinSharedStorage := flag.Bool("join-shared-storage", false, "switch this non-organizer family member to the available shared iCloud+ plan")
 	addPoolMemberDir := flag.String("add-pool-member-dir", "", "add one independently authenticated pool account through Apple's PET in-person flow")
 	removePoolMemberDir := flag.String("remove-pool-member-dir", "", "remove one current non-child pool member from this organizer's family")
+	organizerRoster := flag.Bool("organizer-roster", false, "print an opaque-reference roster from the current organizer family state")
+	removeMemberRef := flag.Bool("remove-member-ref", false, "remove one current non-child family member selected by APPLESERVICES_FAMILY_MEMBER_REF")
 	targetPasswordEnv := flag.Bool("target-password-env", false, "use and immediately clear APPLESERVICES_TARGET_PASSWORD as Apple's rawFallback credential")
 	inviteAccountDir := flag.String("invite-account-dir", "", "target pool account directory for a new organizer invitation")
 	inviteOut := flag.String("invite-out", "", "new private invite checkpoint for the target account")
 	acceptInvite := flag.String("accept-invite", "", "private invite checkpoint bound to this account")
 	safeJSON := flag.Bool("safe-json", false, "print one redacted machine-readable family status line")
 	flag.Parse()
+	referenceMode := *organizerRoster || *removeMemberRef
+	suppressSensitiveFamilyErrors = referenceMode
+	familyRemovalOutcomeEnabled = *removeMemberRef
+	familyRemovalOutcome = "not_submitted"
+	if *organizerRoster && *removeMemberRef {
+		return errors.New("family reference modes are mutually exclusive")
+	}
+	if referenceMode {
+		if !referenceInputs.KeyPresent || !referenceInputs.KeyValid || len(referenceInputs.Key) != 32 {
+			return errors.New("family reference key is missing or invalid")
+		}
+		if *removeMemberRef && (!referenceInputs.RefPresent || !referenceInputs.RefValid || len(referenceInputs.MemberRef) != sha256.Size) {
+			return errors.New("family member reference is missing or invalid")
+		}
+		if *organizerRoster && referenceInputs.RefPresent {
+			return errors.New("organizer roster mode does not accept a member reference")
+		}
+		otherOperation := *poolProjectionOnly || *registryPath != "" || *dump != "" || *listEndpoints || *inspectSetupUI || *setupUIDump != "" || *createFamily || *inspectSubscriptions || *subscriptionsDump != "" || *inspectStorageUI || *storageUIDump != "" || *inspectICloudSharingUI || *iCloudSharingUIDump != "" || *shareICloudStorage || *joinSharedStorage || *addPoolMemberDir != "" || *removePoolMemberDir != "" || *targetPasswordEnv || *inviteAccountDir != "" || *inviteOut != "" || *acceptInvite != ""
+		if otherOperation || (*organizerRoster && *safeJSON) {
+			return errors.New("family reference mode must run independently")
+		}
+	}
 	if *poolProjectionOnly {
-		if *registryPath == "" || *gsaCheckpoint != "" || *dump != "" || *listEndpoints || *inspectSetupUI || *setupUIDump != "" || *createFamily || *inspectSubscriptions || *subscriptionsDump != "" || *inspectStorageUI || *storageUIDump != "" || *inspectICloudSharingUI || *iCloudSharingUIDump != "" || *shareICloudStorage || *joinSharedStorage || *addPoolMemberDir != "" || *removePoolMemberDir != "" || *targetPasswordEnv || *inviteAccountDir != "" || *inviteOut != "" || *acceptInvite != "" || *safeJSON {
+		if *registryPath == "" || *gsaCheckpoint != "" || *dump != "" || *listEndpoints || *inspectSetupUI || *setupUIDump != "" || *createFamily || *inspectSubscriptions || *subscriptionsDump != "" || *inspectStorageUI || *storageUIDump != "" || *inspectICloudSharingUI || *iCloudSharingUIDump != "" || *shareICloudStorage || *joinSharedStorage || *addPoolMemberDir != "" || *removePoolMemberDir != "" || *organizerRoster || *removeMemberRef || *targetPasswordEnv || *inviteAccountDir != "" || *inviteOut != "" || *acceptInvite != "" || *safeJSON {
 			return errors.New("pool projection is a standalone read-only mode and requires -registry")
 		}
 	}
@@ -799,7 +1368,7 @@ func run() error {
 		}
 	}
 	sort.Strings(keys)
-	if !*poolProjectionOnly {
+	if !*poolProjectionOnly && !referenceMode {
 		fmt.Printf("Apple family URL bag loaded; family-keys=%d\n", len(keys))
 	}
 	if *listEndpoints {
@@ -1208,6 +1777,9 @@ func run() error {
 	}
 	details, err := decodeObject(detailsData)
 	if err != nil {
+		if referenceMode {
+			return errors.New("current organizer family details are unavailable")
+		}
 		if *poolProjectionOnly {
 			return errors.New("current FamilyKit member identity unavailable")
 		}
@@ -1246,6 +1818,88 @@ func run() error {
 		}
 		fmt.Printf("family details unavailable; eligibility accepted; eligible-present=%t eligible=%t status-message=%q response-keys=%s; mutation-submitted=false\n", hasEligible, eligible, message, strings.Join(keys, ","))
 		return nil
+	}
+	if *organizerRoster {
+		if !boolValue(details["is-member-of-family"]) {
+			return errors.New("current organizer family membership is unavailable")
+		}
+		members, ok := details["family-members"].([]any)
+		if !ok {
+			return errors.New("current organizer family roster is unavailable")
+		}
+		projection, _, projectErr := projectFamilyReferenceRoster(members, saved.DSID, referenceInputs.Key)
+		if projectErr != nil {
+			return projectErr
+		}
+		encoded, encodeErr := json.Marshal(projection)
+		if encodeErr != nil {
+			return errors.New("cannot encode safe family roster")
+		}
+		fmt.Println(safeFamilyRosterPrefix + string(encoded))
+		return nil
+	}
+	if *removeMemberRef {
+		if !boolValue(details["is-member-of-family"]) {
+			return errors.New("current organizer family membership is unavailable")
+		}
+		members, ok := details["family-members"].([]any)
+		if !ok {
+			return errors.New("current organizer family roster is unavailable")
+		}
+		if _, resolveErr := resolveFamilyMemberReference(members, saved.DSID, referenceInputs.Key, referenceInputs.MemberRef); resolveErr != nil {
+			return resolveErr
+		}
+		removeURL, removeErr := appleEndpoint(familyMemberRemovalURL)
+		if removeErr != nil {
+			return errors.New("family member removal endpoint is unavailable")
+		}
+		organizerRequest := func(endpoint string) (*http.Request, error) {
+			return newFamilyRequest(endpoint, false)
+		}
+		removeOnce := func(targetDSID string) (bool, bool, error) {
+			removeRequest, requestErr := buildFamilyMemberRemovalRequest(removeURL.String(), targetDSID, organizerRequest)
+			if requestErr != nil {
+				return false, false, requestErr
+			}
+			return postFamilyMemberRemoval(apiClient, removeRequest, func() {
+				familyRemovalOutcome = "unknown"
+			})
+		}
+		readback := func() ([]any, error) {
+			verifyCtx, verifyCancel := context.WithTimeout(ctx, 12*time.Second)
+			defer verifyCancel()
+			verifyRequest, requestErr := newFamilyRequest(detailsURL.String(), true)
+			if requestErr != nil {
+				return nil, errors.New("current organizer family readback is unavailable")
+			}
+			verifyRequest = verifyRequest.Clone(verifyCtx)
+			verifyResponse, doErr := apiClient.Do(verifyRequest)
+			if doErr != nil {
+				return nil, errors.New("current organizer family readback is unavailable")
+			}
+			verifyData, readErr := readLimited(verifyResponse)
+			if readErr != nil {
+				return nil, errors.New("current organizer family readback is unavailable")
+			}
+			verifiedDetails, decodeErr := decodeObject(verifyData)
+			if decodeErr != nil || familyResponseError(verifiedDetails) || !boolValue(verifiedDetails["is-member-of-family"]) {
+				return nil, errors.New("current organizer family readback is unavailable")
+			}
+			verifiedMembers, ok := verifiedDetails["family-members"].([]any)
+			if !ok {
+				return nil, errors.New("current organizer family readback is unavailable")
+			}
+			return verifiedMembers, nil
+		}
+		verifiedMembers, removalErr := removeFamilyMemberReference(members, saved.DSID, referenceInputs.Key, referenceInputs.MemberRef, removeOnce, readback, func() {
+			time.Sleep(400 * time.Millisecond)
+		})
+		if removalErr != nil {
+			return removalErr
+		}
+		familyRemovalOutcome = "confirmed"
+		details["family-members"] = verifiedMembers
+		fmt.Printf("family member reference removal verified; members=%d\n", len(verifiedMembers))
 	}
 	if *poolProjectionOnly {
 		if !boolValue(details["is-member-of-family"]) {
@@ -1986,7 +2640,7 @@ func run() error {
 		}
 		fmt.Println(safeFamilyStatusPrefix + string(encoded))
 	}
-	fmt.Printf("family details accepted; members=%d organizers=%d self=%d children=%d invitations=%d pending=%d; mutation-submitted=%t\n", len(members), organizers, me, children, len(invites), len(pending), *createFamily || *shareICloudStorage || *joinSharedStorage || *addPoolMemberDir != "" || *removePoolMemberDir != "" || *inviteAccountDir != "" || acceptedInvitation)
+	fmt.Printf("family details accepted; members=%d organizers=%d self=%d children=%d invitations=%d pending=%d; mutation-submitted=%t\n", len(members), organizers, me, children, len(invites), len(pending), *createFamily || *shareICloudStorage || *joinSharedStorage || *addPoolMemberDir != "" || *removePoolMemberDir != "" || *removeMemberRef || *inviteAccountDir != "" || acceptedInvitation)
 	if *createFamily {
 		fmt.Println("family creation verified; organizer=self members=1 invitations=0")
 	}
@@ -2185,8 +2839,16 @@ func safeFamilyStatus(values map[string]any) string {
 }
 
 func main() {
-	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	err := run()
+	if familyRemovalOutcomeEnabled {
+		fmt.Fprintln(os.Stdout, familyRemovalOutcomePrefix+familyRemovalOutcome)
+	}
+	if err != nil {
+		if suppressSensitiveFamilyErrors {
+			fmt.Fprintln(os.Stderr, "family operation failed")
+		} else {
+			fmt.Fprintln(os.Stderr, err)
+		}
 		os.Exit(1)
 	}
 }

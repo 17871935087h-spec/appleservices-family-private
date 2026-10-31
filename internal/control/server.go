@@ -106,6 +106,7 @@ type Result struct {
 	Probes              []icloud.StorageEndpointProbe   `json:"probes,omitempty"`
 	Family              *FamilyInfo                     `json:"family,omitempty"`
 	FamilyPool          *FamilyPoolProjection           `json:"family_pool,omitempty"`
+	FamilyRoster        *FamilyRosterProjection         `json:"family_roster,omitempty"`
 	HideMyEmail         *icloud.HideMyEmailInfo         `json:"hide_my_email,omitempty"`
 	HMECandidate        string                          `json:"hme_candidate,omitempty"`
 	Activation          *ActivationInfo                 `json:"activation,omitempty"`
@@ -123,6 +124,19 @@ type FamilyPoolMember struct {
 	AccountID string `json:"account_id"`
 	Organizer bool   `json:"organizer"`
 	Child     bool   `json:"child"`
+}
+
+// FamilyRosterProjection contains only opaque member references and masked
+// labels from the current organizer's live family response.
+type FamilyRosterProjection struct {
+	Members           []FamilyRosterMember `json:"members"`
+	UnidentifiedCount int                  `json:"unidentified_count"`
+	TotalCount        int                  `json:"total_count"`
+}
+
+type FamilyRosterMember struct {
+	Ref   string `json:"ref"`
+	Label string `json:"label"`
 }
 
 type ActivationInfo struct {

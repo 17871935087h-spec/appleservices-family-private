@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -52,8 +53,14 @@ type Server struct {
 	registryNote string
 	// provisionMacPush is replaceable only by package tests. Production uses
 	// the pinned native Mac APS bootstrap configured by cmd/dashboard.
-	provisionMacPush    func(context.Context, string) error
-	familyPoolProjector func(context.Context, string, string, string) (*control.FamilyPoolProjection, error)
+	provisionMacPush     func(context.Context, string) error
+	familyPoolProjector  func(context.Context, string, string, string) (*control.FamilyPoolProjection, error)
+	familyRosterKey      string
+	familyRosterReader   familyRosterReaderFunc
+	familyRefRemover     familyRefRemoverFunc
+	familyPoolRemover    func(context.Context, *Account, *Account) (*control.FamilyInfo, *control.FamilyInfo, error)
+	familyRemovalMu      sync.Mutex
+	familyRemovalUnknown map[string]bool
 }
 type Status struct {
 	PID                  int       `json:"pid"`
@@ -116,7 +123,13 @@ func New(config Config) (*Server, error) {
 		listener.Close()
 		return nil, err
 	}
-	s := &Server{config: config, listener: listener, token: hex.EncodeToString(key)}
+	refKey := make([]byte, 32)
+	if _, err = rand.Read(refKey); err != nil {
+		listener.Close()
+		return nil, err
+	}
+	s := &Server{config: config, listener: listener, token: hex.EncodeToString(key), familyRosterKey: base64.RawURLEncoding.EncodeToString(refKey)}
+	clear(refKey)
 	s.provisionMacPush = s.runMacPushProvisioner
 	if entries, err := loadRegistry(config.Dir, config.Dir); err != nil {
 		// Surfaced rather than swallowed: an unreadable registry previously
@@ -788,32 +801,70 @@ func (s *Server) removeFamilyMember(ctx context.Context, organizer *Account, tar
 		return control.Result{Message: "母号或目标成员尚未完成 iCloud 激活", Stage: "family-preflight"}
 	}
 	helper := filepath.Join(filepath.Dir(s.config.Worker), "familyinspect.exe")
-	if info, statErr := os.Stat(helper); statErr != nil || !info.Mode().IsRegular() {
-		return control.Result{Message: "家庭工具不可用，请重新构建本地后台", Stage: "family-worker"}
+	remover := s.familyPoolRemover
+	if remover == nil {
+		if info, statErr := os.Stat(helper); statErr != nil || !info.Mode().IsRegular() {
+			return control.Result{Message: "家庭工具不可用，请重新构建本地后台", Stage: "family-worker"}
+		}
+		remover = func(actionCtx context.Context, organizer, target *Account) (*control.FamilyInfo, *control.FamilyInfo, error) {
+			command := exec.CommandContext(actionCtx, helper, "-dir", organizer.Dir, "-remove-pool-member-dir", target.Dir, "-safe-json")
+			command.Env = os.Environ()
+			var output bytes.Buffer
+			command.Stdout = &output
+			command.Stderr = &output
+			if runErr := command.Run(); runErr != nil {
+				return nil, nil, errors.New("family member removal was not confirmed")
+			}
+			organizerFamily, parseErr := parseFamilyStatus(output.String())
+			if parseErr != nil || !organizerFamily.Member || !organizerFamily.Organizer || organizerFamily.Organizers != 1 || organizerFamily.Self != 1 {
+				return nil, nil, errors.New("organizer family readback was not confirmed")
+			}
+			targetCtx, targetCancel := context.WithTimeout(actionCtx, 35*time.Second)
+			targetFamily, targetErr := runFamilyStatus(targetCtx, helper, target, false)
+			targetCancel()
+			if targetErr != nil || targetFamily.Member {
+				return organizerFamily, targetFamily, errors.New("target family readback was not confirmed")
+			}
+			return organizerFamily, targetFamily, nil
+		}
+	}
+
+	s.familyRemovalMu.Lock()
+	defer s.familyRemovalMu.Unlock()
+	if s.familyRemovalUnknown[organizer.ID] {
+		return control.Result{Message: "上次成员移除结果尚未确认，请先核对家庭状态，暂勿重复提交", Stage: "family-remove-unknown"}
+	}
+	if ctx.Err() != nil {
+		return control.Result{Message: "请求已取消，未提交成员移除", Stage: "family-remove-preflight"}
+	}
+	intentPath, intentErr := createFamilyRemovalIntent(organizer.Dir)
+	if intentErr != nil {
+		if s.familyRemovalUnknown == nil {
+			s.familyRemovalUnknown = make(map[string]bool)
+		}
+		s.familyRemovalUnknown[organizer.ID] = true
+		return control.Result{Message: "存在未完成的成员移除记录或无法保存操作意图，请先核对家庭状态", Stage: "family-remove-unknown"}
+	}
+	markUnknown := func() {
+		if s.familyRemovalUnknown == nil {
+			s.familyRemovalUnknown = make(map[string]bool)
+		}
+		s.familyRemovalUnknown[organizer.ID] = true
 	}
 	actionCtx, cancel := context.WithTimeout(ctx, 105*time.Second)
 	defer cancel()
-	command := exec.CommandContext(actionCtx, helper, "-dir", organizer.Dir, "-remove-pool-member-dir", target.Dir, "-safe-json")
-	command.Env = os.Environ()
-	var output bytes.Buffer
-	command.Stdout = &output
-	command.Stderr = &output
-	if runErr := command.Run(); runErr != nil {
-		return control.Result{Message: "成员移除未完成；请先重新读取双方状态，不要重复提交", Stage: "family-remove"}
+	organizerFamily, targetFamily, runErr := remover(actionCtx, organizer, target)
+	if runErr != nil || actionCtx.Err() != nil || organizerFamily == nil || targetFamily == nil ||
+		!organizerFamily.Member || !organizerFamily.Organizer || organizerFamily.Organizers != 1 || organizerFamily.Self != 1 || targetFamily.Member {
+		markUnknown()
+		return control.Result{Message: "成员移除结果尚未确认；请先核对家庭状态，暂勿重复提交", Stage: "family-remove-unknown"}
 	}
-	organizerFamily, parseErr := parseFamilyStatus(output.String())
-	if parseErr != nil || !organizerFamily.Member || !organizerFamily.Organizer || organizerFamily.Organizers != 1 || organizerFamily.Self != 1 {
-		return control.Result{Message: "Apple 已响应，但母号状态回读不完整；不要重复提交", Stage: "family-remove-readback"}
+	if os.Remove(intentPath) != nil {
+		markUnknown()
+		return control.Result{OK: true, Message: "成员已确认移出家庭，但本地操作记录未能清理；请重新读取状态", Stage: "family-remove-cache-warning", Family: organizerFamily}
 	}
 	organizerFamily.OrganizerAccount, organizerFamily.OrganizerName = organizer.ID, organizer.Name
 	_, organizerCacheErr := writeFamilyCache(organizer, organizerFamily)
-
-	targetCtx, targetCancel := context.WithTimeout(actionCtx, 35*time.Second)
-	targetFamily, targetErr := runFamilyStatus(targetCtx, helper, target, false)
-	targetCancel()
-	if targetErr != nil || targetFamily.Member {
-		return control.Result{Message: "母号已确认成员移除，但目标账号回读未完成；请刷新目标账号，不要重复移除", Stage: "family-remove-target-readback", Family: organizerFamily}
-	}
 	_, targetCacheErr := writeFamilyCache(target, targetFamily)
 	message := "成员已移出家庭，并通过母号与目标账号双边回读"
 	stage := "family-member-removed"
@@ -1344,6 +1395,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if action.Action == "family-pool" {
 				result = s.familyPoolAction(r.Context(), selected)
+				json.NewEncoder(w).Encode(result)
+				return
+			}
+			if action.Action == "family-roster" {
+				result = s.familyRosterAction(r.Context(), selected)
+				json.NewEncoder(w).Encode(result)
+				return
+			}
+			if action.Action == "family-remove-ref" {
+				result = s.familyRemoveRefAction(r.Context(), selected, action.Code)
 				json.NewEncoder(w).Encode(result)
 				return
 			}
