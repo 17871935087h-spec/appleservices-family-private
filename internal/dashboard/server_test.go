@@ -133,6 +133,65 @@ func TestAccountPrivateControlKeepsRenamedLiveWorkerOnline(t *testing.T) {
 	}
 }
 
+func TestDashboardFamilyPoolActionReturnsOnlyOpaqueProjection(t *testing.T) {
+	root := t.TempDir()
+	server, err := New(Config{Dir: root, Worker: filepath.Join(root, "bin", "worker.exe"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.listener.Close()
+	server.accounts = []*Account{
+		{ID: "org-01", AppleID: "organizer@example.test", Dir: filepath.Join(root, "accounts", "org-01")},
+		{ID: "member-02", AppleID: "member@example.test", Dir: filepath.Join(root, "accounts", "member-02")},
+	}
+	var projection *control.FamilyPoolProjection
+	server.familyPoolProjector = func(_ context.Context, _ string, accountDir, registry string) (*control.FamilyPoolProjection, error) {
+		if accountDir != server.accounts[0].Dir || registry != registryPath(root) {
+			t.Fatalf("projector received wrong account binding: dir=%q registry=%q", accountDir, registry)
+		}
+		return projection, nil
+	}
+	request := func() *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, server.URL()+"/api/action?account=org-01", strings.NewReader(`{"action":"family-pool"}`))
+		request.Header.Set("X-App-Token", server.token)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		return response
+	}
+
+	projection = &control.FamilyPoolProjection{Members: []control.FamilyPoolMember{{AccountID: "org-01", Organizer: true}, {AccountID: "member-02", Child: true}}, TotalCount: 3, UnmappedCount: 1}
+	response := request()
+	var result control.Result
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || response.Code != http.StatusOK || !result.OK || result.Stage != "family-pool" || result.FamilyPool == nil || len(result.FamilyPool.Members) != 2 {
+		t.Fatalf("unexpected family pool action result: status=%d body=%s err=%v", response.Code, response.Body, err)
+	}
+	for _, secret := range []string{"organizer@example.test", "member@example.test", "private-dsid", "private-family-id", "password"} {
+		if strings.Contains(response.Body.String(), secret) {
+			t.Fatalf("family pool action leaked %q: %s", secret, response.Body)
+		}
+	}
+
+	projection = &control.FamilyPoolProjection{Members: []control.FamilyPoolMember{{AccountID: "org-01", Organizer: true}, {AccountID: "org-01"}}, TotalCount: 2}
+	invalid := request()
+	var failed control.Result
+	if err := json.Unmarshal(invalid.Body.Bytes(), &failed); err != nil || invalid.Code != http.StatusOK || failed.OK || failed.Stage != "family-pool-failed" {
+		t.Fatalf("invalid projection was not rejected safely: status=%d body=%s err=%v", invalid.Code, invalid.Body, err)
+	}
+}
+
+func TestParseFamilyPoolProjectionRejectsIdentityFieldsAndInvalidCounts(t *testing.T) {
+	for _, output := range []string{
+		`FAMILY_POOL_JSON={"members":[{"account_id":"org-01","organizer":true,"child":false,"apple_id":"private@example.test"}],"unmapped_count":0,"total_count":1}`,
+		`FAMILY_POOL_JSON={"members":[{"account_id":"org-01","organizer":true,"child":false}],"unmapped_count":1,"total_count":1}`,
+	} {
+		if _, err := parseFamilyPoolProjection(output); err == nil {
+			t.Fatalf("unsafe family pool output accepted: %s", output)
+		}
+	}
+}
+
 func TestDeadSavedPIDDoesNotClaimOnlineOrSkipLogin(t *testing.T) {
 	dir := t.TempDir()
 	server, err := New(Config{Dir: dir, Worker: filepath.Join(dir, "worker.exe"), Port: 0})

@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -50,6 +51,31 @@ type familyInviteCheckpoint struct {
 }
 
 const safeFamilyStatusPrefix = "FAMILY_STATUS_JSON="
+const safeFamilyPoolPrefix = "FAMILY_POOL_JSON="
+
+type familyPoolMember struct {
+	AccountID string `json:"account_id"`
+	Organizer bool   `json:"organizer"`
+	Child     bool   `json:"child"`
+}
+
+type familyPoolProjection struct {
+	Members       []familyPoolMember `json:"members"`
+	UnmappedCount int                `json:"unmapped_count"`
+	TotalCount    int                `json:"total_count"`
+}
+
+type familyPoolRegistry struct {
+	Accounts []familyPoolRegistryAccount `json:"accounts"`
+}
+
+type familyPoolRegistryAccount struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	AppleID   string `json:"apple_id"`
+	Dir       string `json:"dir"`
+	CreatedAt string `json:"created_at,omitempty"`
+}
 
 type safeFamilySummary struct {
 	Member                 bool  `json:"member"`
@@ -153,6 +179,192 @@ func familyMemberAppleID(member map[string]any) string {
 		return value
 	}
 	return stringValue(member["member-apple-id"])
+}
+
+var familyPoolAccountIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+
+func normalizeFamilyPoolAppleID(value string) (string, bool) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" || len(value) > 254 || strings.Count(value, "@") != 1 {
+		return "", false
+	}
+	for _, r := range value {
+		if r <= 0x20 || r == 0x7f || r == '\\' || r == '/' {
+			return "", false
+		}
+	}
+	return value, true
+}
+
+func familyPoolMemberIdentity(member map[string]any) (string, bool) {
+	primary, hasPrimary := member["appleId"]
+	secondary, hasSecondary := member["member-apple-id"]
+	if !hasPrimary && !hasSecondary {
+		return "", false
+	}
+	primaryID, primaryOK := primary.(string)
+	secondaryID, secondaryOK := secondary.(string)
+	if hasPrimary && (!primaryOK || strings.TrimSpace(primaryID) == "") || hasSecondary && (!secondaryOK || strings.TrimSpace(secondaryID) == "") {
+		return "", false
+	}
+	if hasPrimary && hasSecondary {
+		left, leftOK := normalizeFamilyPoolAppleID(primaryID)
+		right, rightOK := normalizeFamilyPoolAppleID(secondaryID)
+		if !leftOK || !rightOK || left != right {
+			return "", false
+		}
+		return left, true
+	}
+	if hasPrimary {
+		return normalizeFamilyPoolAppleID(primaryID)
+	}
+	return normalizeFamilyPoolAppleID(secondaryID)
+}
+
+func loadFamilyPoolRegistry(path string) (familyPoolRegistry, error) {
+	var registry familyPoolRegistry
+	if !filepath.IsAbs(path) {
+		return registry, errors.New("family account registry unavailable")
+	}
+	resolvedRegistry, err := filepath.EvalSymlinks(filepath.Clean(path))
+	if err != nil || !filepath.IsAbs(resolvedRegistry) || (runtime.GOOS == "windows" && !strings.EqualFold(filepath.VolumeName(resolvedRegistry), `D:`)) {
+		return registry, errors.New("family account registry unavailable")
+	}
+	info, err := os.Stat(resolvedRegistry)
+	if err != nil || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > 256<<10 {
+		return registry, errors.New("family account registry unavailable")
+	}
+	data, err := os.ReadFile(resolvedRegistry)
+	if err != nil || len(data) > 256<<10 {
+		return registry, errors.New("family account registry unavailable")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&registry) != nil || decoder.Decode(&struct{}{}) != io.EOF || len(registry.Accounts) == 0 || len(registry.Accounts) > 500 {
+		return familyPoolRegistry{}, errors.New("family account registry invalid")
+	}
+	root, err := filepath.EvalSymlinks(filepath.Dir(resolvedRegistry))
+	if err != nil {
+		return familyPoolRegistry{}, errors.New("family account registry unavailable")
+	}
+	seenIDs := make(map[string]bool, len(registry.Accounts))
+	seenAppleIDs := make(map[string]bool, len(registry.Accounts))
+	for _, account := range registry.Accounts {
+		appleID, valid := normalizeFamilyPoolAppleID(account.AppleID)
+		if !familyPoolAccountIDPattern.MatchString(account.ID) || !valid || seenIDs[account.ID] || seenAppleIDs[appleID] || !filepath.IsAbs(account.Dir) {
+			return familyPoolRegistry{}, errors.New("family account registry invalid")
+		}
+		seenIDs[account.ID], seenAppleIDs[appleID] = true, true
+		expectedDir := filepath.Join(root, "accounts", account.ID)
+		resolvedExpected, expectedErr := filepath.EvalSymlinks(expectedDir)
+		resolvedAccount, accountErr := filepath.EvalSymlinks(filepath.Clean(account.Dir))
+		if expectedErr != nil || accountErr != nil || !sameFamilyPoolPath(resolvedExpected, resolvedAccount) {
+			return familyPoolRegistry{}, errors.New("family account directory binding failed")
+		}
+		dirInfo, statErr := os.Stat(resolvedAccount)
+		if statErr != nil || !dirInfo.IsDir() {
+			return familyPoolRegistry{}, errors.New("family account directory unavailable")
+		}
+		var session struct {
+			AppleID       string `json:"AppleID"`
+			LegacyAppleID string `json:"appleId"`
+		}
+		sessionData, readErr := os.ReadFile(filepath.Join(resolvedAccount, "session.json"))
+		if readErr != nil || len(sessionData) == 0 || len(sessionData) > 1<<20 || json.Unmarshal(sessionData, &session) != nil {
+			return familyPoolRegistry{}, errors.New("family account session unavailable")
+		}
+		if session.AppleID != "" && session.LegacyAppleID != "" {
+			left, leftOK := normalizeFamilyPoolAppleID(session.AppleID)
+			right, rightOK := normalizeFamilyPoolAppleID(session.LegacyAppleID)
+			if !leftOK || !rightOK || left != right {
+				return familyPoolRegistry{}, errors.New("family account session binding failed")
+			}
+		}
+		sessionAppleID := session.AppleID
+		if sessionAppleID == "" {
+			sessionAppleID = session.LegacyAppleID
+		}
+		normalizedSession, sessionValid := normalizeFamilyPoolAppleID(sessionAppleID)
+		if !sessionValid || normalizedSession != appleID {
+			return familyPoolRegistry{}, errors.New("family account session binding failed")
+		}
+	}
+	return registry, nil
+}
+
+func sameFamilyPoolPath(left, right string) bool {
+	left, right = filepath.Clean(left), filepath.Clean(right)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+func familyPoolCurrentAccountRegistered(registry familyPoolRegistry, accountDir, appleID string) bool {
+	currentAppleID, valid := normalizeFamilyPoolAppleID(appleID)
+	if !valid || !filepath.IsAbs(accountDir) {
+		return false
+	}
+	resolvedCurrent, err := filepath.EvalSymlinks(filepath.Clean(accountDir))
+	if err != nil {
+		return false
+	}
+	for _, account := range registry.Accounts {
+		registeredAppleID, idValid := normalizeFamilyPoolAppleID(account.AppleID)
+		registeredDir, dirErr := filepath.EvalSymlinks(filepath.Clean(account.Dir))
+		if idValid && dirErr == nil && registeredAppleID == currentAppleID && sameFamilyPoolPath(registeredDir, resolvedCurrent) {
+			return true
+		}
+	}
+	return false
+}
+
+func projectFamilyPool(members []any, currentAppleID string, registry familyPoolRegistry) (familyPoolProjection, error) {
+	projection := familyPoolProjection{Members: make([]familyPoolMember, 0, len(members)), TotalCount: len(members)}
+	current, validCurrent := normalizeFamilyPoolAppleID(currentAppleID)
+	if !validCurrent || len(members) == 0 {
+		return familyPoolProjection{}, errors.New("current family members unavailable")
+	}
+	byAppleID := make(map[string]string, len(registry.Accounts))
+	for _, account := range registry.Accounts {
+		appleID, valid := normalizeFamilyPoolAppleID(account.AppleID)
+		if !valid || !familyPoolAccountIDPattern.MatchString(account.ID) || byAppleID[appleID] != "" {
+			return familyPoolProjection{}, errors.New("family account mapping is ambiguous")
+		}
+		byAppleID[appleID] = account.ID
+	}
+	seenAppleIDs := make(map[string]bool, len(members))
+	currentFound, organizerCount := false, 0
+	for _, raw := range members {
+		member, ok := raw.(map[string]any)
+		if !ok {
+			return familyPoolProjection{}, errors.New("family member identity unavailable")
+		}
+		appleID, identityOK := familyPoolMemberIdentity(member)
+		organizerRaw, organizerExists := member["member-is-organizer"]
+		organizer, organizerOK := organizerRaw.(bool)
+		childRaw, childExists := member["member-is-child-account"]
+		child, childOK := childRaw.(bool)
+		if !identityOK || !organizerExists || !organizerOK || !childExists || !childOK || seenAppleIDs[appleID] {
+			return familyPoolProjection{}, errors.New("family member identity unavailable")
+		}
+		seenAppleIDs[appleID] = true
+		if organizer {
+			organizerCount++
+		}
+		if appleID == current {
+			currentFound = true
+		}
+		if accountID, matched := byAppleID[appleID]; matched {
+			projection.Members = append(projection.Members, familyPoolMember{AccountID: accountID, Organizer: organizer, Child: child})
+		} else {
+			projection.UnmappedCount++
+		}
+	}
+	if !currentFound || organizerCount != 1 {
+		return familyPoolProjection{}, errors.New("family organizer or current member is ambiguous")
+	}
+	return projection, nil
 }
 
 func summarizeFamilyMembers(members []any) (organizers, children, me int, selfOrganizer bool, selfMember map[string]any) {
@@ -403,6 +615,8 @@ func safeFamilyActionIdentifiers(data []byte) []string {
 
 func run() error {
 	dir := flag.String("dir", "", "bound account directory")
+	registryPath := flag.String("registry", "", "dashboard accounts.json path required for pool projection")
+	poolProjectionOnly := flag.Bool("pool-projection", false, "read-only exact FamilyKit member projection for local dashboard accounts")
 	gsaCheckpoint := flag.String("gsa", "", "optional fresh private GSA checkpoint for family app tokens")
 	dump := flag.String("dump", "", "new private raw family response")
 	listEndpoints := flag.Bool("list-endpoints", false, "print safe family endpoint keys, hosts and paths")
@@ -425,6 +639,11 @@ func run() error {
 	acceptInvite := flag.String("accept-invite", "", "private invite checkpoint bound to this account")
 	safeJSON := flag.Bool("safe-json", false, "print one redacted machine-readable family status line")
 	flag.Parse()
+	if *poolProjectionOnly {
+		if *registryPath == "" || *gsaCheckpoint != "" || *dump != "" || *listEndpoints || *inspectSetupUI || *setupUIDump != "" || *createFamily || *inspectSubscriptions || *subscriptionsDump != "" || *inspectStorageUI || *storageUIDump != "" || *inspectICloudSharingUI || *iCloudSharingUIDump != "" || *shareICloudStorage || *joinSharedStorage || *addPoolMemberDir != "" || *removePoolMemberDir != "" || *targetPasswordEnv || *inviteAccountDir != "" || *inviteOut != "" || *acceptInvite != "" || *safeJSON {
+			return errors.New("pool projection is a standalone read-only mode and requires -registry")
+		}
+	}
 	if *inspectICloudSharingUI {
 		*inspectSubscriptions = true
 	}
@@ -563,7 +782,9 @@ func run() error {
 		}
 	}
 	sort.Strings(keys)
-	fmt.Printf("Apple family URL bag loaded; family-keys=%d\n", len(keys))
+	if !*poolProjectionOnly {
+		fmt.Printf("Apple family URL bag loaded; family-keys=%d\n", len(keys))
+	}
 	if *listEndpoints {
 		for _, key := range keys {
 			u, err := appleEndpoint(stringValue(urls[key]))
@@ -970,6 +1191,9 @@ func run() error {
 	}
 	details, err := decodeObject(detailsData)
 	if err != nil {
+		if *poolProjectionOnly {
+			return errors.New("current FamilyKit member identity unavailable")
+		}
 		if *createFamily {
 			return errors.New("family was created but post-action family details are unavailable")
 		}
@@ -1004,6 +1228,29 @@ func run() error {
 			message = message[:160]
 		}
 		fmt.Printf("family details unavailable; eligibility accepted; eligible-present=%t eligible=%t status-message=%q response-keys=%s; mutation-submitted=false\n", hasEligible, eligible, message, strings.Join(keys, ","))
+		return nil
+	}
+	if *poolProjectionOnly {
+		if !boolValue(details["is-member-of-family"]) {
+			return errors.New("current FamilyKit member identity unavailable")
+		}
+		members, ok := details["family-members"].([]any)
+		if !ok {
+			return errors.New("current FamilyKit member identity unavailable")
+		}
+		registry, registryErr := loadFamilyPoolRegistry(*registryPath)
+		if registryErr != nil || !familyPoolCurrentAccountRegistered(registry, *dir, saved.AppleID) {
+			return errors.New("family account registry binding failed")
+		}
+		projection, projectErr := projectFamilyPool(members, saved.AppleID, registry)
+		if projectErr != nil {
+			return projectErr
+		}
+		encoded, encodeErr := json.Marshal(projection)
+		if encodeErr != nil {
+			return errors.New("cannot encode safe family member projection")
+		}
+		fmt.Println(safeFamilyPoolPrefix + string(encoded))
 		return nil
 	}
 	eligible, eligibilityKnown := false, false

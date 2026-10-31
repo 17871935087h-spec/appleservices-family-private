@@ -72,9 +72,24 @@ type Result struct {
 	StoreForm           *icloud.StoreFormInfo           `json:"store_form,omitempty"`
 	Probes              []icloud.StorageEndpointProbe   `json:"probes,omitempty"`
 	Family              *FamilyInfo                     `json:"family,omitempty"`
+	FamilyPool          *FamilyPoolProjection           `json:"family_pool,omitempty"`
 	HideMyEmail         *icloud.HideMyEmailInfo         `json:"hide_my_email,omitempty"`
 	HMECandidate        string                          `json:"hme_candidate,omitempty"`
 	Activation          *ActivationInfo                 `json:"activation,omitempty"`
+}
+
+// FamilyPoolProjection contains exact live family members mapped to local
+// opaque account IDs. It never contains Apple IDs, DSIDs or family identifiers.
+type FamilyPoolProjection struct {
+	Members       []FamilyPoolMember `json:"members"`
+	UnmappedCount int                `json:"unmapped_count"`
+	TotalCount    int                `json:"total_count"`
+}
+
+type FamilyPoolMember struct {
+	AccountID string `json:"account_id"`
+	Organizer bool   `json:"organizer"`
+	Child     bool   `json:"child"`
 }
 
 type ActivationInfo struct {

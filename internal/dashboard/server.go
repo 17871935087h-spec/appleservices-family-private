@@ -51,7 +51,8 @@ type Server struct {
 	registryNote string
 	// provisionMacPush is replaceable only by package tests. Production uses
 	// the pinned native Mac APS bootstrap configured by cmd/dashboard.
-	provisionMacPush func(context.Context, string) error
+	provisionMacPush    func(context.Context, string) error
+	familyPoolProjector func(context.Context, string, string, string) (*control.FamilyPoolProjection, error)
 }
 type Status struct {
 	PID                  int       `json:"pid"`
@@ -463,6 +464,7 @@ func (s *Server) callFor(ctx context.Context, dir, path string, body any, result
 }
 
 const familyStatusPrefix = "FAMILY_STATUS_JSON="
+const familyPoolProjectionPrefix = "FAMILY_POOL_JSON="
 
 func parseFamilyStatus(output string) (*control.FamilyInfo, error) {
 	lines := strings.Split(output, "\n")
@@ -478,6 +480,87 @@ func parseFamilyStatus(output string) (*control.FamilyInfo, error) {
 		return &status, nil
 	}
 	return nil, errors.New("家庭工具没有返回状态")
+}
+
+func parseFamilyPoolProjection(output string) (*control.FamilyPoolProjection, error) {
+	lines := strings.Split(output, "\n")
+	for index := len(lines) - 1; index >= 0; index-- {
+		line := strings.TrimSpace(lines[index])
+		if !strings.HasPrefix(line, familyPoolProjectionPrefix) {
+			continue
+		}
+		decoder := json.NewDecoder(strings.NewReader(strings.TrimPrefix(line, familyPoolProjectionPrefix)))
+		decoder.DisallowUnknownFields()
+		var projection control.FamilyPoolProjection
+		if decoder.Decode(&projection) != nil || decoder.Decode(&struct{}{}) != io.EOF || projection.TotalCount <= 0 || projection.UnmappedCount < 0 || projection.UnmappedCount+len(projection.Members) != projection.TotalCount {
+			return nil, errors.New("family member projection invalid")
+		}
+		seen := make(map[string]bool, len(projection.Members))
+		organizers := 0
+		for _, member := range projection.Members {
+			if !idPattern.MatchString(member.AccountID) || seen[member.AccountID] {
+				return nil, errors.New("family member projection invalid")
+			}
+			seen[member.AccountID] = true
+			if member.Organizer {
+				organizers++
+			}
+		}
+		if organizers > 1 {
+			return nil, errors.New("family member projection invalid")
+		}
+		return &projection, nil
+	}
+	return nil, errors.New("family member projection missing")
+}
+
+func runFamilyPoolProjection(ctx context.Context, helper, accountDir, registry string) (*control.FamilyPoolProjection, error) {
+	command := exec.CommandContext(ctx, helper, "-dir", accountDir, "-registry", registry, "-pool-projection")
+	command.Env = os.Environ()
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Run(); err != nil || output.Len() > 128<<10 {
+		return nil, errors.New("current family member projection unavailable")
+	}
+	projection, err := parseFamilyPoolProjection(output.String())
+	if err != nil {
+		return nil, errors.New("current family member projection unavailable")
+	}
+	return projection, nil
+}
+
+func (s *Server) familyPoolAction(ctx context.Context, account *Account) control.Result {
+	if account == nil {
+		return control.Result{Stage: "family-pool-failed", Message: "家庭成员列表未确认"}
+	}
+	helper := filepath.Join(filepath.Dir(s.config.Worker), "familyinspect.exe")
+	projector := s.familyPoolProjector
+	if projector == nil {
+		projector = runFamilyPoolProjection
+	}
+	projection, err := projector(ctx, helper, account.Dir, registryPath(s.config.Dir))
+	if err != nil || projection == nil {
+		return control.Result{Stage: "family-pool-failed", Message: "家庭成员列表未确认"}
+	}
+	if projection.TotalCount <= 0 || projection.UnmappedCount < 0 || projection.UnmappedCount+len(projection.Members) != projection.TotalCount {
+		return control.Result{Stage: "family-pool-failed", Message: "家庭成员列表未确认"}
+	}
+	seen := make(map[string]bool, len(projection.Members))
+	organizers := 0
+	for _, member := range projection.Members {
+		if !idPattern.MatchString(member.AccountID) || seen[member.AccountID] || s.lookup(member.AccountID) == nil {
+			return control.Result{Stage: "family-pool-failed", Message: "家庭成员列表未确认"}
+		}
+		seen[member.AccountID] = true
+		if member.Organizer {
+			organizers++
+		}
+	}
+	if organizers > 1 {
+		return control.Result{Stage: "family-pool-failed", Message: "家庭成员列表未确认"}
+	}
+	return control.Result{OK: true, Stage: "family-pool", Message: "家庭成员映射已确认", FamilyPool: projection}
 }
 
 func runFamilyStatus(ctx context.Context, helper string, account *Account, joinStorage bool) (*control.FamilyInfo, error) {
@@ -1189,6 +1272,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			var result control.Result
+			if action.Action == "family-pool" {
+				result = s.familyPoolAction(r.Context(), selected)
+				json.NewEncoder(w).Encode(result)
+				return
+			}
 			if selected != nil && action.Action == "family-remove-member" {
 				result = s.removeFamilyMember(r.Context(), selected, action.Code)
 				json.NewEncoder(w).Encode(result)
