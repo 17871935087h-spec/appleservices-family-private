@@ -8,6 +8,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -159,5 +160,64 @@ func TestAcceptPendingTermsRequiresRepairCookie(t *testing.T) {
 	client := &HideMyEmailClient{setupBase: "https://setup.icloud.com/setup/ws/1", http: http.DefaultClient, jar: jar}
 	if err := client.AcceptPendingTerms(context.Background()); !errors.Is(err, ErrHMEWebRepairSessionUnavailable) {
 		t.Fatalf("missing repair session was not rejected: %v", err)
+	}
+}
+
+func TestHMESetupFailureReportsStatusWithoutAuthenticatedData(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Set-Cookie", "private-cookie=private-cookie-value")
+		w.WriteHeader(http.StatusMisdirectedRequest)
+		_, _ = w.Write([]byte(`{"token":"private-response-token"}`))
+	}))
+	defer server.Close()
+	client := &HideMyEmailClient{http: server.Client()}
+	data, err := client.hmeSetupRequest(context.Background(), http.MethodPost, server.URL+"/accountLogin?dsid=private-account", []byte(`{"dsWebAuthToken":"private-request-token"}`))
+	var setup *HMEWebSetupError
+	if !errors.As(err, &setup) || setup.HTTPStatus != http.StatusMisdirectedRequest || setup.FailureKind != "http" || data != nil {
+		t.Fatalf("setup rejection lost its classification: %v", err)
+	}
+	for _, private := range []string{server.URL, "private-account", "private-response-token", "private-request-token", "private-cookie-value"} {
+		if strings.Contains(err.Error(), private) {
+			t.Fatal("setup diagnostic leaked authenticated data")
+		}
+	}
+}
+
+func TestHMEAccountLoginPreservesSetupFailure(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/accountLogin" {
+			t.Errorf("unexpected setup request path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	client := &HideMyEmailClient{setupBase: server.URL, http: server.Client()}
+	err := client.accountLogin(context.Background(), &hmeAuthState{sessionToken: "private-token", accountCountry: "USA"}, false)
+	var setup *HMEWebSetupError
+	if !errors.As(err, &setup) || setup.HTTPStatus != http.StatusUnauthorized || requests != 1 {
+		t.Fatalf("accountLogin hid or retried the setup rejection: %v", err)
+	}
+	if !strings.Contains(err.Error(), "session establishment failed") || strings.Contains(err.Error(), "private-token") {
+		t.Fatal("accountLogin diagnostic lost context or exposed the token")
+	}
+}
+
+type hmeTimeoutTransport struct{}
+
+func (hmeTimeoutTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, context.DeadlineExceeded
+}
+
+func TestHMESetupTimeoutOmitsRequestURL(t *testing.T) {
+	client := &HideMyEmailClient{http: &http.Client{Transport: hmeTimeoutTransport{}}}
+	_, err := client.hmeSetupRequest(context.Background(), http.MethodPost, "https://setup.example.test/accountLogin?token=private-token", nil)
+	var setup *HMEWebSetupError
+	if !errors.As(err, &setup) || setup.FailureKind != "timeout" || setup.HTTPStatus != 0 {
+		t.Fatalf("setup timeout was not classified: %v", err)
+	}
+	if strings.Contains(err.Error(), "example.test") || strings.Contains(err.Error(), "private-token") {
+		t.Fatal("transport diagnostic exposed the request URL")
 	}
 }

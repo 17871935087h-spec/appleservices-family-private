@@ -7,8 +7,21 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/Laky-64/appleservices/icloud"
 	"github.com/Laky-64/appleservices/internal/control"
 )
+
+func hmeSessionFailure(err error) control.Result {
+	result := control.Result{Message: "隐藏邮件地址会话未就绪：" + err.Error(), Stage: "hme-session"}
+	var setup *icloud.HMEWebSetupError
+	if errors.As(err, &setup) {
+		result.HTTPStatus = setup.HTTPStatus
+	}
+	if errors.Is(err, icloud.ErrHMEWebRepairRequired) {
+		result.Stage = "hme-terms-required"
+	}
+	return result
+}
 
 type hmeFamilyCache struct {
 	Version   int                `json:"version"`

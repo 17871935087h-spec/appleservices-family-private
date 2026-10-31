@@ -611,7 +611,7 @@ func run() (runErr error) {
 			defer done()
 			info, err := loadHME(queryCtx)
 			if err != nil {
-				return control.Result{Message: "隐藏邮件地址会话未就绪：" + err.Error(), Stage: "hme-session"}
+				return hmeSessionFailure(err)
 			}
 			label := strings.TrimSpace(commandLabel)
 			note := strings.TrimSpace(commandNote)

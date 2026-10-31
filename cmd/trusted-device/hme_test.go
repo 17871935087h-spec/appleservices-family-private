@@ -3,14 +3,28 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Laky-64/appleservices/icloud"
 	"github.com/Laky-64/appleservices/internal/control"
 )
+
+func TestHMESessionFailureRetainsSafeSetupStatus(t *testing.T) {
+	err := fmt.Errorf("accountLogin: %w", &icloud.HMEWebSetupError{HTTPStatus: 421, FailureKind: "http"})
+	result := hmeSessionFailure(err)
+	if result.OK || result.Stage != "hme-session" || result.HTTPStatus != 421 || !strings.Contains(result.Message, "HTTP 421") {
+		t.Fatalf("setup status was hidden from the dashboard: %#v", result)
+	}
+	result = hmeSessionFailure(icloud.ErrHMEWebRepairRequired)
+	if result.OK || result.Stage != "hme-terms-required" || result.HTTPStatus != 0 {
+		t.Fatal("terms repair was not distinguished from setup rejection")
+	}
+}
 
 func TestReachableVerificationReconcilesAppliedAppleMutation(t *testing.T) {
 	info := &icloud.HideMyEmailInfo{ForwardToEmails: []string{"primary@example.test", "new@example.test"}}

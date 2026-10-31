@@ -37,6 +37,20 @@ var (
 	ErrHMEWebRepairSessionUnavailable = errors.New("没有可复用的 iCloud Web repair 会话")
 )
 
+// HMEWebSetupError describes a failed Web setup request without including its
+// authenticated URL, request body, cookies, or response body.
+type HMEWebSetupError struct {
+	HTTPStatus  int
+	FailureKind string
+}
+
+func (e *HMEWebSetupError) Error() string {
+	if e.HTTPStatus != 0 {
+		return fmt.Sprintf("Apple iCloud Web setup request failed (HTTP %d, %s)", e.HTTPStatus, e.FailureKind)
+	}
+	return fmt.Sprintf("Apple iCloud Web setup request failed (%s)", e.FailureKind)
+}
+
 type HideMyEmailAlias struct {
 	Email           string `json:"email"`
 	Label           string `json:"label,omitempty"`
@@ -433,7 +447,7 @@ func (c *HideMyEmailClient) accountLogin(ctx context.Context, state *hmeAuthStat
 	loginBody, _ := json.Marshal(map[string]any{"dsWebAuthToken": state.sessionToken, "accountCountryCode": state.accountCountry, "extended_login": true, "trustToken": state.trustToken})
 	data, err := c.hmeSetupRequest(ctx, http.MethodPost, setupBase+"/accountLogin", loginBody)
 	if err != nil {
-		return errors.New("Apple iCloud Web session establishment failed")
+		return fmt.Errorf("Apple iCloud Web session establishment failed: %w", err)
 	}
 	var result hmeAccountLoginResult
 	if json.Unmarshal(data, &result) != nil || result.DSInfo.DSID == "" {
@@ -466,7 +480,7 @@ func (c *HideMyEmailClient) accountLogin(ctx context.Context, state *hmeAuthStat
 func (c *HideMyEmailClient) hmeSetupRequest(ctx context.Context, method, endpoint string, body []byte) ([]byte, error) {
 	request, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, &HMEWebSetupError{FailureKind: "invalid-request"}
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "*/*")
@@ -475,12 +489,22 @@ func (c *HideMyEmailClient) hmeSetupRequest(ctx context.Context, method, endpoin
 	request.Header.Set("User-Agent", hmeWebUserAgent)
 	response, err := c.http.Do(request)
 	if err != nil {
-		return nil, err
+		kind := "network"
+		var timeout interface{ Timeout() bool }
+		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeout) && timeout.Timeout()) {
+			kind = "timeout"
+		} else if errors.Is(err, context.Canceled) {
+			kind = "canceled"
+		}
+		return nil, &HMEWebSetupError{FailureKind: kind}
 	}
 	defer response.Body.Close()
 	data, readErr := io.ReadAll(io.LimitReader(response.Body, (4<<20)+1))
-	if readErr != nil || len(data) > 4<<20 || response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, errors.New("Apple iCloud Web setup request failed")
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, &HMEWebSetupError{HTTPStatus: response.StatusCode, FailureKind: "http"}
+	}
+	if readErr != nil || len(data) > 4<<20 {
+		return nil, &HMEWebSetupError{HTTPStatus: response.StatusCode, FailureKind: "invalid-response"}
 	}
 	return data, nil
 }
