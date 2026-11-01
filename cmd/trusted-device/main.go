@@ -24,6 +24,7 @@ import (
 	"github.com/Laky-64/appleservices/icloud"
 	"github.com/Laky-64/appleservices/internal/circle"
 	"github.com/Laky-64/appleservices/internal/control"
+	"github.com/Laky-64/appleservices/internal/credentialvault"
 	"github.com/Laky-64/appleservices/nativeadi"
 )
 
@@ -306,6 +307,9 @@ func run() (runErr error) {
 	if err != nil {
 		return err
 	}
+	if err := stopResumedSessionOnVerification(*resumeSession, login.NeedsTwoFactor(), &status, *dir); err != nil {
+		return err
+	}
 	input := bufio.NewReader(os.Stdin)
 	if login.NeedsTwoFactor() && *method == "circle" {
 		if panel == nil || !*guiAuth {
@@ -451,6 +455,9 @@ func run() (runErr error) {
 	}
 	if err := active.SaveSession(); err != nil {
 		return err
+	}
+	if err := saveCredentialAfterSuccessfulLogin(*dir, appleID, password, *resumeSession); err != nil {
+		fmt.Fprintln(os.Stderr, "Credential vault save failed; the authenticated login remains active:", err)
 	}
 	status.Authenticated, status.State = true, "online"
 	if err != nil {
@@ -1453,6 +1460,25 @@ func run() (runErr error) {
 			}
 		}
 	}
+}
+
+func saveCredentialAfterSuccessfulLogin(accountDir, appleID, password string, resumeSession bool) error {
+	if resumeSession || password == "" {
+		return nil
+	}
+	return credentialvault.Save(accountDir, appleID, password)
+}
+
+func stopResumedSessionOnVerification(resumeSession, needsTwoFactor bool, status *runtimeStatus, dir string) error {
+	if !resumeSession || !needsTwoFactor {
+		return nil
+	}
+	status.VerificationRequired = true
+	status.State = "verification_required"
+	if err := status.save(dir); err != nil {
+		return err
+	}
+	return errVerificationRequired
 }
 
 func lastNonEmptyLine(value string) string {

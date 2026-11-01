@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Laky-64/appleservices/internal/control"
+	"github.com/Laky-64/appleservices/internal/credentialvault"
 	"github.com/Laky-64/appleservices/internal/privatebody"
 )
 
@@ -103,13 +104,14 @@ type dashboardAction struct {
 }
 
 type Gateway struct {
-	config       Config
-	dashboardURL url.URL
-	journal      *journal
-	client       *http.Client
-	transport    *http.Transport
-	locksMu      sync.Mutex
-	locks        map[string]chan struct{}
+	config           Config
+	dashboardURL     url.URL
+	journal          *journal
+	client           *http.Client
+	transport        *http.Transport
+	credentialLoader credentialLoader
+	locksMu          sync.Mutex
+	locks            map[string]chan struct{}
 }
 
 func New(cfg Config) (*Gateway, error) {
@@ -151,7 +153,7 @@ func New(cfg Config) (*Gateway, error) {
 		},
 		// No CookieJar: dashboard cookies are never accepted or forwarded.
 	}
-	return &Gateway{config: cfg, dashboardURL: dashboardURL, journal: store, client: client, transport: transport, locks: make(map[string]chan struct{})}, nil
+	return &Gateway{config: cfg, dashboardURL: dashboardURL, journal: store, client: client, transport: transport, credentialLoader: credentialvault.Load, locks: make(map[string]chan struct{})}, nil
 }
 
 func (g *Gateway) Close() { g.transport.CloseIdleConnections() }
@@ -190,6 +192,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/v1/accounts/list":
 		g.handleAccountsList(w, r)
+	case credentialEndpointPath:
+		g.handleCredential(w, r)
 	case "/v1/resolve":
 		g.handleResolve(w, r)
 	case "/v1/family/read":
