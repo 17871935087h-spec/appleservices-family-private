@@ -46,7 +46,24 @@ function renderFamily(info,{checkedAt='',stale=false,animate=true}={}){
   if(animate){shell.classList.remove('family-updated');requestAnimationFrame(()=>shell.classList.add('family-updated'));window.setTimeout(()=>shell.classList.remove('family-updated'),700);}
 }
 function resetHME(){hmeInfo=null;hmeAccount='';hmeCandidate='';hmeVisible=100;hmeEditing='';setHMEFeedback('');$('hmeCandidatePanel').hidden=true;$('hmeReachablePanel').hidden=true;$('hmeReachableCodeForm').hidden=true;$('hmeReachableEmail').value='';$('hmeReachableCode').value='';$('hmeSearch').value='';renderHME(null);}
-function renderActivation(view){const activated=!!view?.icloud_activated,ready=!!view?.activation_ready&&!activated,card=$('activationCard');if(activationAccount&&activationAccount!==selectedAccount){activationInfo=null;activationAccount='';}card.hidden=!ready;if(!ready)return;$('activationState').textContent=activationInfo?.required?'需要同意条款':'待检查';$('activationSummary').textContent=activationInfo?.required?'Apple 要求先接受当前条款；确认后后台会自动生成本账号 NAC、完成 delegate 并读取配额。':'账号验证码会话已保存；检查 Apple 当前条款后可在此继续激活。';const versions=activationInfo?.required?'地区 '+activationInfo.region+' · iCloud '+activationInfo.icloud_version+' · 媒体服务 '+(activationInfo.media_version||'无更新'):'';$('activationVersions').textContent=versions;$('activationVersions').hidden=!versions;for(const [id,url] of [['activationICloudTerms',activationInfo?.icloud_terms_url],['activationMediaTerms',activationInfo?.media_terms_url]]){const link=$(id);link.hidden=!url;if(url)link.href=url;}$('activationCheckButton').hidden=!!activationInfo?.required;$('activationCheckButton').disabled=busy;$('activationAcceptButton').hidden=!activationInfo?.required;$('activationAcceptButton').disabled=busy;}
+function renderActivation(view){
+  const activated=!!view?.icloud_activated,account=!!(view?.selected||selectedAccount),ready=account&&!!view?.activation_ready&&!activated;
+  if(!ready||(activationAccount&&activationAccount!==selectedAccount)){activationInfo=null;activationAccount='';}
+  const terms=ready&&!!activationInfo?.required;
+  $('activationCard').hidden=false;
+  $('activationState').textContent=activated?'已保存激活记录':!account?'未选择账号':!ready?'需要账号验证':terms?'等待同意条款':'待检查条款';
+  $('activationSummary').textContent=activated?'已保存 iCloud 激活记录。可在下方查询储存空间，确认当前服务是否可用。':!account?'请选择要激活的账号，再检查 iCloud 激活状态。':!ready?'当前账号没有可供继续激活的已验证会话。请先核对上方的账号验证状态。':terms?'请查看 Apple 当前条款，确认同意后继续激活 iCloud 服务。':'账号验证会话已保存。点击“检查激活状态”读取 Apple 当前条款，再确认是否继续激活。';
+  const versions=terms?'地区 '+activationInfo.region+' · iCloud '+activationInfo.icloud_version+' · 媒体服务 '+(activationInfo.media_version||'无更新'):'';
+  $('activationVersions').textContent=versions;
+  $('activationVersions').hidden=!versions;
+  for(const [id,url] of [['activationICloudTerms',terms&&activationInfo.icloud_terms_url],['activationMediaTerms',terms&&activationInfo.media_terms_url]]){
+    const link=$(id);link.hidden=!url;if(url)link.href=url;else link.removeAttribute('href');
+  }
+  $('activationCheckButton').hidden=activated||terms;
+  $('activationCheckButton').disabled=busy||!ready;
+  $('activationAcceptButton').hidden=!terms;
+  $('activationAcceptButton').disabled=busy||!terms;
+}
 function hmeDate(value){if(!value)return '时间未知';const stamp=Number(value);const date=new Date(stamp<100000000000?stamp*1000:stamp);return Number.isNaN(date.getTime())?'时间未知':new Intl.DateTimeFormat('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'}).format(date);}
 function showHMECandidate(candidate){hmeCandidate=candidate||'';$('hmeCandidateAddress').textContent=hmeCandidate||'—';$('hmeCandidatePanel').hidden=!hmeCandidate;if(hmeCandidate){$('hmeCreateLabel').value='';$('hmeCreateNote').value='';$('hmeCreateLabel').focus();}}
 function setHMEFeedback(message,state=''){const element=$('hmeActionStatus');element.textContent=message||'';element.hidden=!message;element.dataset.state=message?state:'';$('hmeActionFeedback').hidden=!message;}
