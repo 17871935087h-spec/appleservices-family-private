@@ -61,6 +61,7 @@ type Server struct {
 	familyPoolRemover    func(context.Context, *Account, *Account) (*control.FamilyInfo, *control.FamilyInfo, error)
 	familyRemovalMu      sync.Mutex
 	familyRemovalUnknown map[string]bool
+	primaryMailRunner    func(context.Context, *Account, primaryMailInput) primaryMailState
 }
 type Status struct {
 	PID                  int       `json:"pid"`
@@ -1277,6 +1278,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"message":"请刷新面板后重试"}`, 403)
 			return
 		}
+		if s.handlePrimaryMailAPI(w, r) {
+			return
+		}
 		switch {
 		case r.Method == "GET" && r.URL.Path == "/api/view":
 			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
@@ -1500,6 +1504,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	case "/app.css":
 		file = "app.css"
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	case "/primary-mail.js":
+		file = "primary-mail.js"
+		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	case "/primary-mail.css":
+		file = "primary-mail.css"
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
 	default:
 		http.NotFound(w, r)

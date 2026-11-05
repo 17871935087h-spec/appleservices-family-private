@@ -7,6 +7,8 @@
   <title>appleservices · 设备控制台</title>
   <link rel="stylesheet" href="/app.css">
   <script src="/app.js" defer></script>
+  <link rel="stylesheet" href="/primary-mail.css">
+  <script src="/primary-mail.js" defer></script>
 </head>
 <body>
 <aside class="sidebar">
@@ -78,6 +80,21 @@
       <p id="familyRosterStatus" role="status" aria-live="polite">点击“读取家庭成员”后，显示组织者当前成员；无法识别的成员不会提供移除选项。</p>
     </div>
     <p class="family-safety" id="familySafety">购买共享和位置共享不会开启；验证码仅在 Apple 挑战出现后由当前账号自己的本地 Mac 身份生成。</p>
+  </section>
+  <section class="request-card overview-only primary-mail-card" id="primaryMailCard" aria-labelledby="primaryMailTitle">
+    <div class="card-title-row"><h3 id="primaryMailTitle">iCloud 主邮箱</h3><button type="button" class="text-button" id="primaryMailRead">读取状态</button></div>
+    <p class="card-description">创建账户的 @icloud.com 邮箱，与“隐藏邮件地址”分别管理。</p>
+    <p id="primaryMailStatus" role="status" aria-live="polite">选择账号后读取主邮箱状态。</p>
+    <strong id="primaryMailAddress" class="primary-mail-address" hidden></strong>
+    <form id="primaryMailForm" hidden>
+      <label class="primary-mail-label" for="primaryMailPrefix">邮箱前缀 <span>留空随机生成</span></label>
+      <div class="primary-mail-input"><input id="primaryMailPrefix" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="20" pattern="[a-z][a-z0-9._]{2,19}" aria-describedby="primaryMailPrefixHelp"><span>@icloud.com</span></div>
+      <p id="primaryMailPrefixHelp" class="card-description">3–20 位，以小写字母开头，可包含数字、点和下划线。</p>
+      <label class="primary-mail-check"><input id="primaryMailPermanent" type="checkbox">我确认创建这个永久邮箱地址，创建后不能改名。</label>
+      <label class="primary-mail-check"><input id="primaryMailWebLogin" type="checkbox">需要时，使用已保存密码和受信任设备完成网页登录。</label>
+      <p class="card-description">不会发送短信；如需确认条款或 Apple 拒绝请求，会停止并显示状态。</p>
+      <button class="button button-primary" id="primaryMailCreate" type="submit" disabled>开通 iCloud 邮箱</button>
+    </form>
   </section>
   <section class="request-card overview-only hme-card" id="hmeCard" hidden>
     <div class="card-title-row"><div><span class="card-kicker">iCloud+ 子号工具</span><h3>隐藏邮件地址</h3></div><div class="commerce-actions"><button id="hmeReconnectButton" class="text-button" type="button">重新连接当前账号</button><button class="text-button" id="hmeListButton">读取地址</button><button class="text-button hme-create-button" id="hmeGenerateButton">＋ 生成候选</button></div></div>
