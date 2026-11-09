@@ -849,12 +849,230 @@ def make_reply(account_id, stage, email=None, target=None, can_create=False):
     return result
 
 
-def read_legacy_history(directory):
-    paths = (
-        directory / "primary-mail-once" / "operation.json",
-        directory / "mail-mccgateway-once" / "operation.json",
+LEGACY_OPERATION_KEYS = frozenset({
+    "version", "fingerprint", "account_id", "utc", "activation_attempts",
+    "settings_before", "status", "target", "activation_response",
+    "settings_after", "updated_utc", "header_correction",
+})
+LEGACY_CORRECTION_KEYS = frozenset({
+    "profile", "attempt", "status", "utc", "reason", "settings_before",
+    "activation_response",
+})
+LEGACY_RESPONSE_KEYS = frozenset({
+    "http_status", "response_bytes", "success_field", "updatePersonErrorCode",
+})
+LEGACY_SETTINGS_REQUIRED_KEYS = frozenset({
+    "http_status", "response_bytes", "parsed", "account_info_present",
+    "primary_field_present", "primary_field_empty", "primary_state",
+    "primary_address", "response_identity", "apple_mail_aliases", "mail_flags",
+    "account_info_path", "schema_top", "schema_account_info", "business_error",
+    "account_locked", "account_status_code",
+})
+LEGACY_SETTINGS_OPTIONAL_KEYS = frozenset({"ErrorID", "errorCode", "statusCode"})
+LEGACY_SETTINGS_KEYS = LEGACY_SETTINGS_REQUIRED_KEYS | LEGACY_SETTINGS_OPTIONAL_KEYS
+LEGACY_CORRECTION_PROFILE = "xkji-header-correction-v1"
+LEGACY_CORRECTION_REASON = (
+    "static_sample_proves_legacy_User_Agent_and_setup_update_account_ui_Referer"
+)
+LEGACY_TARGET_RE = re.compile(r"^m[a-f0-9]{14}@icloud\.com$")
+LEGACY_READ_LIMIT = 64 * 1024
+
+
+def legacy_fingerprint(context):
+    """Reproduce the v1 primary-mail-once account binding."""
+    values = (context.account_id, context.apple_id.strip().casefold(), context.dsid, context.adsid)
+    if not all(isinstance(value, str) and value for value in values):
+        return ""
+    material = "\x00".join(values).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _legacy_path_present(path):
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # Inaccessible legacy state is present-but-unknown, never permission to write.
+        return True
+
+
+def _legacy_timestamp(value):
+    if not isinstance(value, str) or not value or len(value) > 80:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        return None
+    return parsed
+
+
+def _legacy_target(value):
+    return value if isinstance(value, str) and LEGACY_TARGET_RE.fullmatch(value) else ""
+
+
+def _legacy_empty_snapshot(value):
+    if not isinstance(value, dict):
+        return False
+    if not LEGACY_SETTINGS_REQUIRED_KEYS.issubset(value) or set(value) - LEGACY_SETTINGS_KEYS:
+        return False
+    if (type(value.get("http_status")) is not int or value["http_status"] != 200
+            or type(value.get("response_bytes")) is not int
+            or not 0 < value["response_bytes"] <= MAX_HTTP
+            or value.get("parsed") is not True
+            or value.get("account_info_present") is not True
+            or value.get("primary_field_present") is not True
+            or value.get("primary_field_empty") is not True
+            or value.get("primary_state") != "empty"
+            or value.get("primary_address") is not None
+            or value.get("response_identity") != "matched"
+            or value.get("apple_mail_aliases") != []
+            or value.get("business_error") is not False
+            or value.get("account_locked") is not False
+            or type(value.get("account_status_code")) is not int
+            or value["account_status_code"] != 2):
+        return False
+    if value.get("account_info_path") not in (
+        "appleAccountInfo", "com.apple.mobileme.appleAccountInfo",
+    ):
+        return False
+    if not isinstance(value.get("mail_flags"), dict):
+        return False
+    for key, item in value["mail_flags"].items():
+        if not isinstance(key, str) or not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9]{0,70}", key):
+            return False
+        if type(item) in (bool, int):
+            continue
+        if not isinstance(item, str) or not (
+            item in {"empty_string", "nonempty_string"}
+            or re.fullmatch(r"list_length_[0-9]{1,6}", item)
+        ):
+            return False
+    for key in ("schema_top", "schema_account_info"):
+        items = value.get(key)
+        if (not isinstance(items, list) or len(items) > 80
+                or any(not isinstance(item, str)
+                       or not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_.-]{0,70}", item)
+                       for item in items)):
+            return False
+    for key in LEGACY_SETTINGS_OPTIONAL_KEYS:
+        if key not in value:
+            continue
+        item = value[key]
+        if key == "ErrorID":
+            if not (type(item) is int and item == 0 or isinstance(item, str) and item == ""):
+                return False
+        elif not (
+            type(item) is int and item == 0
+            or isinstance(item, str) and item in {"", "0", "OK", "SUCCESS"}
+        ):
+            return False
+    return True
+
+
+def _legacy_rejected_response(value):
+    return (
+        isinstance(value, dict) and set(value) == LEGACY_RESPONSE_KEYS
+        and type(value.get("http_status")) is int and value["http_status"] == 200
+        and type(value.get("response_bytes")) is int and value["response_bytes"] == 48
+        and value.get("success_field") is False
+        and type(value.get("updatePersonErrorCode")) is int
+        and value["updatePersonErrorCode"] == -20103
     )
-    return any(path.exists() or path.is_symlink() for path in paths)
+
+
+def _legacy_no_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON field")
+        result[key] = value
+    return result
+
+
+def _legacy_recoverable(record, context):
+    if not isinstance(record, dict) or set(record) != LEGACY_OPERATION_KEYS:
+        return False
+    if (type(record.get("version")) is not int or record["version"] != 1
+            or record.get("account_id") != context.account_id
+            or not isinstance(record.get("fingerprint"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", record["fingerprint"])
+            or record["fingerprint"] != legacy_fingerprint(context)
+            or type(record.get("activation_attempts")) is not int
+            or record["activation_attempts"] != 2
+            or record.get("status") != "outcome_unknown"
+            or not _legacy_target(record.get("target"))
+            or not _legacy_timestamp(record.get("utc"))
+            or not _legacy_timestamp(record.get("updated_utc"))
+            or not _legacy_empty_snapshot(record.get("settings_before"))
+            or not _legacy_empty_snapshot(record.get("settings_after"))
+            or not _legacy_rejected_response(record.get("activation_response"))):
+        return False
+    correction = record.get("header_correction")
+    if not isinstance(correction, dict) or set(correction) != LEGACY_CORRECTION_KEYS:
+        return False
+    return (
+        correction.get("profile") == LEGACY_CORRECTION_PROFILE
+        and type(correction.get("attempt")) is int and correction["attempt"] == 2
+        and correction.get("status") == "response_observed"
+        and correction.get("reason") == LEGACY_CORRECTION_REASON
+        and _legacy_timestamp(correction.get("utc")) is not None
+        and _legacy_empty_snapshot(correction.get("settings_before"))
+        and _legacy_rejected_response(correction.get("activation_response"))
+    )
+
+
+def _native_empty_for_legacy_recovery(settings):
+    if not isinstance(settings, dict):
+        return False
+    return (
+        stage_from_native(settings) == "not_open"
+        and settings.get("http_status") == 200
+        and settings.get("parsed") is True
+        and settings.get("account_info_present") is True
+        and settings.get("response_identity") == "matched"
+        and settings.get("primary_field_present") is True
+        and settings.get("primary_field_empty") is True
+        and settings.get("primary_state") == "empty"
+        and settings.get("primary_address") is None
+        and settings.get("apple_mail_aliases") == []
+        and settings.get("business_error") is False
+        and settings.get("account_locked") is False
+    )
+
+
+def read_legacy_history(directory, context=None, native=None):
+    primary_dir = directory / "primary-mail-once"
+    primary_path = primary_dir / "operation.json"
+    other_dir = directory / "mail-mccgateway-once"
+    other_path = other_dir / "operation.json"
+    primary_present = _legacy_path_present(primary_dir) or _legacy_path_present(primary_path)
+    other_present = _legacy_path_present(other_dir) or _legacy_path_present(other_path)
+    if not primary_present and not other_present:
+        return {"present": False, "recoverable": False, "target": "", "sha256": ""}
+
+    result = {"present": True, "recoverable": False, "target": "", "sha256": ""}
+    if other_present or primary_dir.is_symlink() or not primary_dir.is_dir():
+        return result
+    if primary_path.is_symlink() or not primary_path.is_file():
+        return result
+    try:
+        raw = read_bytes(primary_path, LEGACY_READ_LIMIT)
+        result["sha256"] = hashlib.sha256(raw).hexdigest()
+        record = json.loads(raw, object_pairs_hook=_legacy_no_duplicate_keys)
+    except (Stop, OSError, ValueError, UnicodeError):
+        return result
+    if not isinstance(record, dict):
+        return result
+    result["target"] = _legacy_target(record.get("target"))
+    if (context is not None and native is not None
+            and _native_empty_for_legacy_recovery(native)
+            and _legacy_recoverable(record, context)):
+        result["recoverable"] = True
+    return result
 
 
 def session_path(directory):
@@ -1064,14 +1282,35 @@ def perform_create(context, request, native_before, services):
     prior_target = target_from_record(operation_path) if operation_exists else ""
     if operation_exists:
         return make_reply(context.account_id, "outcome_unknown", target=prior_target, can_create=False)
-    if read_legacy_history(context.directory):
-        return make_reply(context.account_id, "outcome_unknown", can_create=False)
-    if state != "not_open":
-        return current_primary_reply(context.account_id, native_before, False)
-    if native_before.get("account_locked") is not False:
-        return make_reply(context.account_id, "unknown", can_create=False)
+    legacy = read_legacy_history(context.directory, context, native_before)
+    if legacy["present"]:
+        if not legacy["recoverable"]:
+            return make_reply(
+                context.account_id, "outcome_unknown", target=legacy["target"], can_create=False,
+            )
+        requested_prefix = request.get("prefix", "")
+        if requested_prefix != "":
+            try:
+                requested_target = make_target(requested_prefix)
+            except Stop as exc:
+                return make_reply(
+                    context.account_id, exc.stage, target=legacy["target"], can_create=False,
+                )
+            if requested_target != legacy["target"]:
+                return make_reply(
+                    context.account_id, "invalid_request", target=legacy["target"], can_create=False,
+                )
+        target = legacy["target"]
+    else:
+        if state != "not_open":
+            return current_primary_reply(context.account_id, native_before, False)
+        if native_before.get("account_locked") is not False:
+            return make_reply(context.account_id, "unknown", can_create=False)
+        try:
+            target = make_target(request.get("prefix", ""))
+        except Stop as exc:
+            return make_reply(context.account_id, exc.stage, can_create=False)
 
-    target = make_target(request.get("prefix", ""))
     try:
         session = services.web_session(context, request)
     except Stop as exc:
@@ -1082,6 +1321,8 @@ def perform_create(context, request, native_before, services):
         "account_id": context.account_id, "stage": "preflight", "target": target,
         "activation_attempts": 0, "created_at": services.now(),
     }
+    if legacy["recoverable"]:
+        record["legacy_source_sha256"] = legacy["sha256"]
     try:
         client = services.web_client(session, record)
         web_before = client.validate(context.apple_id, context.dsid, target)
@@ -1095,6 +1336,16 @@ def perform_create(context, request, native_before, services):
         return make_reply(context.account_id, exc.stage, target=target, can_create=can_create)
     except Exception:
         return make_reply(context.account_id, "unavailable", target=target, can_create=False)
+
+    if legacy["recoverable"]:
+        latest_legacy = read_legacy_history(context.directory, context, native_before)
+        if (not latest_legacy["recoverable"]
+                or latest_legacy["sha256"] != legacy["sha256"]
+                or latest_legacy["target"] != target
+                or operation_path.exists() or operation_path.is_symlink()):
+            return make_reply(
+                context.account_id, "outcome_unknown", target=target, can_create=False,
+            )
 
     mail_dir.mkdir(parents=True, exist_ok=True)
     record.update(stage="intent", activation_attempts=1, availability_confirmed=True)
@@ -1172,8 +1423,15 @@ def run_request(request, services=None):
                 return current_primary_reply(context.account_id, native, False)
             mail_dir = context.directory / "primary-mail"
             operation = mail_dir / "operation.json"
-            if operation.exists() or operation.is_symlink() or read_legacy_history(context.directory):
+            if operation.exists() or operation.is_symlink():
                 return make_reply(context.account_id, "outcome_unknown", target=target_from_record(operation))
+            legacy = read_legacy_history(context.directory, context, native)
+            if legacy["present"]:
+                if not legacy["recoverable"]:
+                    return make_reply(
+                        context.account_id, "outcome_unknown", target=legacy["target"],
+                    )
+            legacy_target = legacy["target"] if legacy["recoverable"] else ""
             if stage != "not_open":
                 return current_primary_reply(context.account_id, native, False)
             login_intent = mail_dir / "login-intent.json"
@@ -1181,7 +1439,7 @@ def run_request(request, services=None):
             saved_session = session_path(context.directory)
             if login_intent.exists() or login_intent.is_symlink():
                 if saved_session.exists() and not saved_session.is_symlink():
-                    return current_primary_reply(context.account_id, native, True)
+                    return current_primary_reply(context.account_id, native, True, target=legacy_target)
                 try:
                     previous = read_json(login_state, 64 * 1024)
                     previous_stage = previous.get("stage")
@@ -1189,8 +1447,8 @@ def run_request(request, services=None):
                     previous_stage = "outcome_unknown"
                 if previous_stage not in {"verification_required", "terms_required", "risk_blocked", "unavailable"}:
                     previous_stage = "outcome_unknown"
-                return make_reply(context.account_id, previous_stage)
-            return current_primary_reply(context.account_id, native, True)
+                return make_reply(context.account_id, previous_stage, target=legacy_target)
+            return current_primary_reply(context.account_id, native, True, target=legacy_target)
         if request.get("confirm_permanent") is not True:
             return make_reply(context.account_id, "invalid_request")
         mail_dir = context.directory / "primary-mail"
