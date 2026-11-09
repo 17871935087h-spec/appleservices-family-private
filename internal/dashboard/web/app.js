@@ -3,18 +3,44 @@ const $=id=>document.getElementById(id), token=document.querySelector('meta[name
 let loginMode='reconnect',loginAccount='',current=null,busy=false,privateCode='',privateCodeKind='',hideAt=0,lastState='',lastQuery='',lastRefresh='',lastRequest='',noticeTimer,selectedAccount=localStorage.getItem('selected-account')||'',familyInfo=null,familyAccount='',familyCheckedAt='',familyStale=false,storageAccount='',storageCheckedAt='',planAccount='',planCheckedAt='',poolOrganizerAccount=localStorage.getItem('family-organizer-account')||'',poolOrganizerName=localStorage.getItem('family-organizer-name')||'',purchaseAction='',purchaseLabel='',hmeInfo=null,hmeAccount='',hmeCandidate='',hmeFilter='active',hmeVisible=100,hmeEditing='',activationInfo=null,activationAccount='',autoRefreshScheduled=false;
 let familyRoster=null,familyRosterMessage='点击“读取家庭成员”以读取组织者当前的 Apple 成员名单。',familyRosterRequest=0;
 const autoRefreshState=new Map();
+const autoRefreshMaxAge=150000;
 const autoRefreshOwner=(globalThis.crypto?.randomUUID?.()||Math.random().toString(36).slice(2));
 function autoRefreshLeaseKey(account){return 'appleservices:auto-refresh:'+account;}
 function autoRefreshAttemptKey(key){return 'appleservices:auto-attempt:'+key;}
-function acquireAutoRefreshLease(account){try{const key=autoRefreshLeaseKey(account),now=Date.now();let lease={};try{lease=JSON.parse(localStorage.getItem(key)||'{}');}catch{}if(lease.owner&&lease.owner!==autoRefreshOwner&&Number(lease.expires)>now)return false;localStorage.setItem(key,JSON.stringify({owner:autoRefreshOwner,expires:now+150000}));return JSON.parse(localStorage.getItem(key)||'{}').owner===autoRefreshOwner;}catch{return true;}}
-function renewAutoRefreshLease(account){try{const key=autoRefreshLeaseKey(account),lease=JSON.parse(localStorage.getItem(key)||'{}');if(lease.owner===autoRefreshOwner)localStorage.setItem(key,JSON.stringify({owner:autoRefreshOwner,expires:Date.now()+150000}));}catch{}}
+function acquireAutoRefreshLease(account){try{const key=autoRefreshLeaseKey(account),now=Date.now();let lease={};try{lease=JSON.parse(localStorage.getItem(key)||'{}');}catch{}if(lease.owner&&lease.owner!==autoRefreshOwner&&Number(lease.expires)>now)return false;localStorage.setItem(key,JSON.stringify({owner:autoRefreshOwner,expires:now+autoRefreshMaxAge}));return JSON.parse(localStorage.getItem(key)||'{}').owner===autoRefreshOwner;}catch{return true;}}
+function renewAutoRefreshLease(account){try{const key=autoRefreshLeaseKey(account),lease=JSON.parse(localStorage.getItem(key)||'{}');if(lease.owner===autoRefreshOwner)localStorage.setItem(key,JSON.stringify({owner:autoRefreshOwner,expires:Date.now()+autoRefreshMaxAge}));}catch{}}
 function releaseAutoRefreshLease(account){try{const key=autoRefreshLeaseKey(account),lease=JSON.parse(localStorage.getItem(key)||'{}');if(lease.owner===autoRefreshOwner)localStorage.removeItem(key);}catch{}}
-function autoRefreshAttemptStatus(key){try{const value=JSON.parse(localStorage.getItem(autoRefreshAttemptKey(key))||'{}');return value.status||'';}catch{return '';}}
+function autoRefreshAttemptStatus(key){
+  let value=autoRefreshState.get(key);
+  try{const saved=JSON.parse(localStorage.getItem(autoRefreshAttemptKey(key))||'{}');if(saved?.status)value=saved;}catch{}
+  if(!value?.status)return '';
+  const age=Date.now()-Number(value.at);
+  if(value.status==='refreshing'&&(!Number.isFinite(age)||age<0||age>=autoRefreshMaxAge)){
+    value={...value,status:'failed'};autoRefreshState.set(key,value);
+    try{localStorage.setItem(autoRefreshAttemptKey(key),JSON.stringify(value));}catch{}
+  }
+  return value.status;
+}
 function autoRefreshAttempted(key){return !!autoRefreshAttemptStatus(key);}
-function markAutoRefreshAttempt(key,status='refreshing'){try{localStorage.setItem(autoRefreshAttemptKey(key),JSON.stringify({status,owner:autoRefreshOwner,at:Date.now()}));}catch{}}
-function clearAutoRefreshAttempt(key){try{localStorage.removeItem(autoRefreshAttemptKey(key));}catch{}}
+function markAutoRefreshAttempt(key,status='refreshing'){const value={status,owner:autoRefreshOwner,at:Date.now()};autoRefreshState.set(key,value);try{localStorage.setItem(autoRefreshAttemptKey(key),JSON.stringify(value));}catch{}}
+function finishAutoRefreshAttempt(key,status){
+  let value=autoRefreshState.get(key);
+  try{const saved=JSON.parse(localStorage.getItem(autoRefreshAttemptKey(key))||'{}');if(saved?.owner)value=saved;}catch{}
+  if(value?.owner===autoRefreshOwner)markAutoRefreshAttempt(key,status);
+}
+function clearAutoRefreshAttempt(key){autoRefreshState.delete(key);try{localStorage.removeItem(autoRefreshAttemptKey(key));}catch{}}
 const time=value=>{if(!value||value.startsWith('0001'))return '—';return new Intl.DateTimeFormat('zh-CN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Singapore',hour12:false}).format(new Date(value));};
-async function api(path,data){const suffix=path==='view'&&!selectedAccount?'':(selectedAccount?'?account='+encodeURIComponent(selectedAccount):'');const response=await fetch('/api/'+path+suffix,{method:data===undefined?'GET':'POST',headers:{'X-App-Token':token,'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data),cache:'no-store'});if(!response.ok)throw new Error(response.status===403?'请刷新面板后重试':'操作未完成，请稍后重试');return response.json();}
+async function api(path,data){
+  const suffix=path==='view'&&!selectedAccount?'':(selectedAccount?'?account='+encodeURIComponent(selectedAccount):'');
+  const deadline=path==='view'?12000:path==='action'&&['family-info','family-info-direct','storage-info','storage-plan'].includes(data?.action)?100000:0;
+  const controller=deadline?new AbortController():null,timer=controller?setTimeout(()=>controller.abort(),deadline):null;
+  try{
+    const response=await fetch('/api/'+path+suffix,{method:data===undefined?'GET':'POST',headers:{'X-App-Token':token,'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data),cache:'no-store',...(controller?{signal:controller.signal}:{})});
+    if(!response.ok)throw new Error(response.status===403?'请刷新面板后重试':'操作未完成，请稍后重试');
+    return await response.json();
+  }catch(error){if(controller?.signal.aborted)throw new Error('读取 Apple 状态超时，可点击重新核验');throw error;}
+  finally{if(timer!==null)clearTimeout(timer);}
+}
 function notice(message,error=false){$('notice').textContent=message;$('notice').classList.toggle('error',error);$('notice').hidden=false;clearTimeout(noticeTimer);noticeTimer=setTimeout(()=>{$('notice').hidden=true;},6500);}
 function activity(text,when=new Date().toISOString()){const list=$('activityList');list.querySelector('.empty-activity')?.remove();const entry=document.createElement('div');entry.className='activity-entry';const label=document.createElement('span');label.textContent=text;const stamp=document.createElement('time');stamp.textContent=time(when);entry.append(label,stamp);list.prepend(entry);while(list.children.length>4)list.lastElementChild.remove();}
 function clearCode(){privateCode='';hideAt=0;$('codeDisplay').classList.remove('shown');$('codeDisplay').textContent='•••  •••';$('codeDetail').textContent=current?.code_ready?'点击按钮显示六位验证码':'登录后可生成六位验证码';$('copyButton').disabled=true;}
@@ -24,9 +50,9 @@ function deviceIcon(device){const label=(device.model+' '+device.name).toLowerCa
 function renderDevices(devices,status=current?.status||{}){const grid=$('deviceGrid');grid.replaceChildren();if(!devices?.length){const empty=document.createElement('div');empty.className='empty-state';const state=status?.state||'';if(state==='device_identity_refresh_required'||state==='device_query_failed'){empty.textContent='设备列表读取失败，请重新连接当前账号后再试';}else if(state==='refresh_failed'){empty.textContent='登录续期暂未完成，设备列表暂不可用';}else if(status?.running){empty.textContent='正在同步设备列表…';}else{empty.textContent='登录后，你的设备会显示在这里';}grid.append(empty);return;}for(const device of [...devices].sort((a,b)=>Number(b.installation)-Number(a.installation))){const card=document.createElement('article');card.className='device-card'+(device.installation?' installation':'');const icon=document.createElement('div');icon.className='device-icon';icon.innerHTML=deviceIcon(device);const info=document.createElement('div');info.className='device-info';const name=document.createElement('h3');name.textContent=device.name||'Apple 设备';const model=document.createElement('p');model.textContent=device.model||'已关联设备';info.append(name,model);const tags=document.createElement('div');tags.className='device-tags';if(device.installation){const tag=document.createElement('span');tag.className='device-tag blue';tag.textContent='本机登记';tags.append(tag);}if(device.trusted===true){const tag=document.createElement('span');tag.className='device-tag green';tag.textContent='受信任';tags.append(tag);}if(device.current&&!device.installation){const tag=document.createElement('span');tag.className='device-tag';tag.textContent='当前认证设备';tags.append(tag);}if(tags.children.length)info.append(tags);card.append(icon,info);grid.append(card);}}
 function gib(value){return value?(value/1073741824).toLocaleString('zh-CN',{maximumFractionDigits:0})+'GB':'—';}
 function autoRefreshKey(kind,checkedAt){return selectedAccount+'|'+kind+'|'+(checkedAt||'none');}
-function cacheLabel(kind,checkedAt,stale){if(!stale)return '已保存 · '+(checkedAt?time(checkedAt):'刚刚');const key=autoRefreshKey(kind,checkedAt),state=autoRefreshState.get(key)||autoRefreshAttemptStatus(key);if(state==='refreshing')return '正在后台核验 Apple…';if(state==='failed')return '自动核验失败 · '+(checkedAt?time(checkedAt):'刚刚');return '等待后台核验 · '+(checkedAt?time(checkedAt):'刚刚');}
+function cacheLabel(kind,checkedAt,stale){if(!stale)return '已保存 · '+(checkedAt?time(checkedAt):'刚刚');const key=autoRefreshKey(kind,checkedAt),state=autoRefreshAttemptStatus(key);if(state==='refreshing')return '正在后台核验 Apple…';if(state==='failed')return '核验未完成 · 可重新核验';if(state==='done')return '已完成核验 · 缓存待更新';return '等待后台核验 · '+(checkedAt?time(checkedAt):'刚刚');}
 function renderStorage(info,{checkedAt='',stale=false}={}){storageAccount=selectedAccount;storageCheckedAt=checkedAt||'';const note=$('storageCacheNote');if(!info){$('storageSummary').textContent='登录后查询当前容量和使用情况。';note.textContent='尚无本地状态';note.classList.remove('stale');return;}const format=x=>(x/1073741824).toLocaleString('zh-CN',{maximumFractionDigits:2})+' GB';$('storageSummary').textContent='已用 '+format(info.used_bytes)+' / '+format(info.total_bytes)+' · 可用 '+format(info.available_bytes);note.textContent=cacheLabel('storage',checkedAt,stale);note.classList.toggle('stale',!!stale);}
-function updateFamilyCacheMeta(checkedAt='',stale=false,hasInfo=!!familyInfo){familyCheckedAt=checkedAt||'';familyStale=!!stale;const shell=$('familyCard');shell.classList.toggle('cache-stale',familyStale);if(!hasInfo){$('familyCacheNote').textContent='尚无本地状态';$('familyRefreshButton').textContent='读取 Apple 状态';return;}const key=autoRefreshKey('family',familyCheckedAt),state=autoRefreshState.get(key)||autoRefreshAttemptStatus(key);$('familyCacheNote').textContent=cacheLabel('family',familyCheckedAt,familyStale);$('familyRefreshButton').textContent=state==='refreshing'?'正在核验…':'重新核验 Apple';}
+function updateFamilyCacheMeta(checkedAt='',stale=false,hasInfo=!!familyInfo){familyCheckedAt=checkedAt||'';familyStale=!!stale;const shell=$('familyCard');shell.classList.toggle('cache-stale',familyStale);if(!hasInfo){$('familyCacheNote').textContent='尚无本地状态';$('familyRefreshButton').textContent='读取 Apple 状态';return;}const key=autoRefreshKey('family',familyCheckedAt),state=autoRefreshAttemptStatus(key);$('familyCacheNote').textContent=cacheLabel('family',familyCheckedAt,familyStale);$('familyRefreshButton').textContent=state==='refreshing'?'正在核验…':'重新核验 Apple';}
 function renderFamily(info,{checkedAt='',stale=false,animate=true}={}){
   familyInfo=info||null;familyAccount=selectedAccount;
   const shell=$('familyCard'),card=$('familyStatus'),metrics=$('familyMetrics'),map=$('familyMap'),controls=$('familyControls'),removeControls=$('familyRemoveControls');card.className='family-status';
@@ -91,23 +117,23 @@ function openLogin(mode){
 function scheduleAutoRefresh(view,activated){
   if(busy||autoRefreshScheduled||!activated)return;
   const candidates=[];
-  if(view.family&&view.family_stale)candidates.push({kind:'family',action:'family-info',checkedAt:view.family_checked_at});
+  if(view.family&&view.family_stale)candidates.push({kind:'family',action:'family-info-direct',checkedAt:view.family_checked_at});
   if(view.storage&&view.storage_stale)candidates.push({kind:'storage',action:'storage-info',checkedAt:view.storage_checked_at});
   if(view.storage_plan&&view.storage_plan_stale)candidates.push({kind:'plan',action:'storage-plan',checkedAt:view.storage_plan_checked_at});
   if(!candidates.length){releaseAutoRefreshLease(selectedAccount);return;}
-  const target=candidates.find(item=>{const key=autoRefreshKey(item.kind,item.checkedAt);return !autoRefreshState.has(key)&&!autoRefreshAttempted(key);});
+  const target=candidates.find(item=>{const key=autoRefreshKey(item.kind,item.checkedAt);return !autoRefreshAttempted(key);});
   if(!target){releaseAutoRefreshLease(selectedAccount);return;}
   const account=selectedAccount,key=autoRefreshKey(target.kind,target.checkedAt);
   if(!acquireAutoRefreshLease(account))return;
   markAutoRefreshAttempt(key);
-  autoRefreshState.set(key,'refreshing');autoRefreshScheduled=true;
+  autoRefreshScheduled=true;
   if(target.kind==='family')updateFamilyCacheMeta(view.family_checked_at,true,true);
   if(target.kind==='storage')renderStorage(view.storage,{checkedAt:view.storage_checked_at,stale:true});
   if(target.kind==='plan')renderPlans(view.storage_plan,{checkedAt:view.storage_plan_checked_at,stale:true});
-  window.setTimeout(()=>{autoRefreshScheduled=false;if(account!==selectedAccount||busy){autoRefreshState.delete(key);clearAutoRefreshAttempt(key);releaseAutoRefreshLease(account);return;}renewAutoRefreshLease(account);action(target.action,{}, {silent:true,automatic:true,autoKey:key});},80);
+  window.setTimeout(()=>{autoRefreshScheduled=false;if(account!==selectedAccount||busy){clearAutoRefreshAttempt(key);releaseAutoRefreshLease(account);return;}renewAutoRefreshLease(account);action(target.action,{}, {silent:true,automatic:true,autoKey:key});},80);
 }
 function render(view){const previousSelected=selectedAccount;current=view;selectedAccount=view.selected||selectedAccount;if(previousSelected!==selectedAccount)invalidateFamilyRoster('当前组织者已切换，请读取新组织者的家庭成员名单。');
-if(view.accounts)renderAccounts(view);if(view.family){const changed=familyAccount!==selectedAccount||!familyInfo||familyCheckedAt!==view.family_checked_at;if(changed)renderFamily(view.family,{checkedAt:view.family_checked_at,stale:view.family_stale,animate:false});else updateFamilyCacheMeta(view.family_checked_at,view.family_stale,true);}else if(familyAccount===selectedAccount&&familyInfo)renderFamily(null);if(view.storage){if(storageAccount!==selectedAccount||storageCheckedAt!==view.storage_checked_at)renderStorage(view.storage,{checkedAt:view.storage_checked_at,stale:view.storage_stale});}else if(storageAccount===selectedAccount&&storageCheckedAt)renderStorage(null);if(view.storage_plan){if(planAccount!==selectedAccount||planCheckedAt!==view.storage_plan_checked_at)renderPlans(view.storage_plan,{checkedAt:view.storage_plan_checked_at,stale:view.storage_plan_stale});}else if(planAccount===selectedAccount&&planCheckedAt)renderPlans(null);renderActivation(view);const status=view.status||{},online=status.running&&status.authenticated,activated=!!view.icloud_activated,waiting=status.verification_required,running=status.running||view.launching,starting=running&&!online&&!waiting;
+if(view.accounts)renderAccounts(view);if(view.family){const changed=familyAccount!==selectedAccount||!familyInfo||familyCheckedAt!==view.family_checked_at;if(changed)renderFamily(view.family,{checkedAt:view.family_checked_at,stale:view.family_stale,animate:false});else updateFamilyCacheMeta(view.family_checked_at,view.family_stale,true);}else if(familyAccount===selectedAccount&&familyInfo)renderFamily(null);if(view.storage){renderStorage(view.storage,{checkedAt:view.storage_checked_at,stale:view.storage_stale});}else if(storageAccount===selectedAccount&&storageCheckedAt)renderStorage(null);if(view.storage_plan){if(planAccount!==selectedAccount||planCheckedAt!==view.storage_plan_checked_at)renderPlans(view.storage_plan,{checkedAt:view.storage_plan_checked_at,stale:view.storage_plan_stale});else{$('planCacheNote').textContent=cacheLabel('plan',view.storage_plan_checked_at,view.storage_plan_stale);$('planCacheNote').classList.toggle('stale',!!view.storage_plan_stale);}}else if(planAccount===selectedAccount&&planCheckedAt)renderPlans(null);renderActivation(view);const status=view.status||{},online=status.running&&status.authenticated,activated=!!view.icloud_activated,waiting=status.verification_required,running=status.running||view.launching,starting=running&&!online&&!waiting;
 const titles={initializing:'正在初始化本机身份',signing_in:'正在登录 Apple 账户',starting:'正在建立后台连接',refresh_failed:'登录刷新暂未完成',verification_required:'需要重新验证账户',awaiting_sms:'完成短信验证',awaiting_existing_sms:'输入已有短信验证码',awaiting_device_code:'输入设备验证码',awaiting_account_validation:'验证 Apple 账户',awaiting_pairing:'等待设备配对',awaiting_pairing_code:'输入设备配对码',verifying_pairing:'正在验证设备配对'};
 $('sessionTitle').textContent=online?(status.push_issue==='reconnecting'?'登录正常 · 推送重连中':status.state==='refresh_failed'?'已登录 · 续期暂未完成':'登录持续在线'):(titles[status.state]||(status.state==='failed'&&!activated?'后台异常停止':starting?'正在连接 Apple':waiting?'需要短信验证':activated?'iCloud 已激活':'连接你的 Apple 账户'));
 $('sessionDescription').textContent=online?(status.push_issue==='reconnecting'?'账户会话仍保留，后台正在恢复推送连接。':'设备身份已保留，后台会自动保持登录。'):waiting?(status.state==='awaiting_account_validation'?'请使用受信任 Apple 设备收到的验证码完成账户验证。':'请使用绑定手机号收到的验证码完成登录。'):starting?'正在恢复这台电脑的设备身份，请稍等。':activated?'Apple 已接受该账号的 iCloud 会话，可直接读取配额与可购方案。':status.state==='failed'?'后台运行出错，设备身份和已保存的会话仍保留。请重新连接。':'登录后，即可查看设备和生成本机验证码。';
@@ -182,6 +208,9 @@ async function removeFamilyRosterMember(){
 async function action(name,extra={},options={}){
   if(busy)return;
   const familyAction=name.startsWith('family-'),hmeAction=name.startsWith('hme-'),actionAccount=selectedAccount;
+  const refreshKind=({'family-info':'family','family-info-direct':'family','storage-info':'storage','storage-plan':'plan'})[name];
+  const refreshKey=options.autoKey||(refreshKind?autoRefreshKey(refreshKind,refreshKind==='family'?familyCheckedAt:refreshKind==='storage'?storageCheckedAt:planCheckedAt):'');
+  if(refreshKey&&!options.autoKey){if(!acquireAutoRefreshLease(actionAccount)){if(!options.silent)notice('其他面板正在核验此账号，请稍后重试');return;}markAutoRefreshAttempt(refreshKey);}
   if(hmeAction&&current?.hide_my_email_update_required){setHMEFeedback('当前账号仍在使用旧版后台，请先点击标题右侧“重新连接当前账号”并完成登录。','error');return;}
   if(hmeAction)setHMEFeedback(hmeLoadingMessage(name),'loading');
   if(name.startsWith('hme-')&&familyStale){
@@ -197,6 +226,7 @@ async function action(name,extra={},options={}){
   busy=true;document.body.classList.add('busy');if(familyAction)$('familyCard').classList.add('is-loading');if(hmeAction)$('hmeCard').classList.add('is-loading');if(current)render(current);
   try{
     const result=await api('action',{action:name,...extra});
+    if(refreshKind&&selectedAccount!==actionAccount)return;
     if(hmeAction&&selectedAccount!==actionAccount){setHMEFeedback('');return;}
     if(result.family){const checkedAt=new Date().toISOString();if(current){current.family=result.family;current.family_checked_at=checkedAt;current.family_stale=false;}renderFamily(result.family,{checkedAt,stale:false});}
     if(!result.ok){
@@ -258,11 +288,11 @@ async function action(name,extra={},options={}){
         result.family=joined.family;checkedAt=new Date().toISOString();if(current){current.family=result.family;current.family_checked_at=checkedAt;current.family_stale=false;}renderFamily(result.family,{checkedAt,stale:false});result.message='池内账号已加入家庭并启用共享 iCloud+ 储存';
       }
     }
-    if(options.autoKey)autoRefreshState.delete(options.autoKey);
+    if(refreshKey)finishAutoRefreshAttempt(refreshKey,'done');
     if(result.code)showCode(result);else if(!options.silent)notice(result.message||'操作已完成');
     await poll();
-  }catch(error){if(hmeAction&&selectedAccount!==actionAccount){setHMEFeedback('');return;}if(options.autoKey){autoRefreshState.set(options.autoKey,'failed');markAutoRefreshAttempt(options.autoKey,'failed');}if(hmeAction&&$('hmeActionStatus').dataset.state==='loading')setHMEFeedback(error.message||'隐藏邮件地址操作未完成。','error');if(!options.silent)notice(error.message,true);}
-  finally{busy=false;document.body.classList.remove('busy');if(familyAction)$('familyCard').classList.remove('is-loading');if(hmeAction)$('hmeCard').classList.remove('is-loading');if(current&&(!hmeAction||selectedAccount===actionAccount))render(current);}
+  }catch(error){if(refreshKey)finishAutoRefreshAttempt(refreshKey,'failed');if(selectedAccount!==actionAccount)return;if(hmeAction&&$('hmeActionStatus').dataset.state==='loading')setHMEFeedback(error.message||'隐藏邮件地址操作未完成。','error');if(!options.silent)notice(error.message,true);}
+  finally{if(refreshKey){if(autoRefreshAttemptStatus(refreshKey)==='refreshing')finishAutoRefreshAttempt(refreshKey,'failed');releaseAutoRefreshLease(actionAccount);}busy=false;document.body.classList.remove('busy');if(familyAction)$('familyCard').classList.remove('is-loading');if(hmeAction)$('hmeCard').classList.remove('is-loading');if(current&&current.selected===selectedAccount)render(current);}
 }
 $('reloadView').addEventListener('click',poll);$('codeButton').addEventListener('click',()=>action('code'));$('devicesButton').addEventListener('click',()=>action('devices'));$('renewButton').addEventListener('click',()=>action('validate-account'));
 $('storageButton').addEventListener('click',()=>action('storage-info'));
