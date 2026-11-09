@@ -9,6 +9,8 @@
   <script src="/app.js" defer></script>
   <link rel="stylesheet" href="/primary-mail.css">
   <script src="/primary-mail.js" defer></script>
+  <link rel="stylesheet" href="/app-passwords.css">
+  <script src="/app-passwords.js" defer></script>
 </head>
 <body>
 <aside class="sidebar">
@@ -95,6 +97,41 @@
       <p class="card-description">不会发送短信；如需确认条款或 Apple 拒绝请求，会停止并显示状态。</p>
       <button class="button button-primary" id="primaryMailCreate" type="submit" disabled>开通 iCloud 邮箱</button>
     </form>
+  </section>
+  <section class="request-card overview-only app-passwords-card" id="appPasswordsCard" aria-labelledby="appPasswordsTitle">
+    <div class="card-title-row"><h3 id="appPasswordsTitle">App 专用密码</h3><button type="button" class="text-button" id="appPasswordsRead">读取列表</button></div>
+    <p id="appPasswordsStatus" role="status" aria-live="polite" aria-atomic="true">选择账号后读取状态。不会自动连接或生成密码。</p>
+    <div class="app-passwords-connect">
+      <p class="app-passwords-note">连接管理会话前，请明确确认以下两项。验证只使用当前受信任设备，不会发送短信。</p>
+      <label class="primary-mail-check" for="appPasswordsSaveConsent"><input id="appPasswordsSaveConsent" type="checkbox">我允许使用服务器已保存的当前账号密码连接管理会话。</label>
+      <label class="primary-mail-check" for="appPasswordsDeviceConsent"><input id="appPasswordsDeviceConsent" type="checkbox">我允许需要时使用现有受信任设备完成验证。</label>
+      <button type="button" class="button button-light" id="appPasswordsConnect">连接管理会话</button>
+    </div>
+    <div class="app-passwords-workspace" id="appPasswordsWorkspace">
+      <form class="app-passwords-create" id="appPasswordsCreateForm">
+        <label for="appPasswordsDescription">新密码标签</label>
+        <input id="appPasswordsDescription" maxlength="128" autocomplete="off" value="邮件客户端">
+        <label class="primary-mail-check" for="appPasswordsPasswordChallenge"><input id="appPasswordsPasswordChallenge" type="checkbox">允许本次需要时使用已保存主密码复核。</label>
+        <button type="submit" class="button button-primary" id="appPasswordsCreate">新建 App 专用密码</button>
+      </form>
+      <div class="app-passwords-result-actions">
+        <button type="button" class="text-button" id="appPasswordsShowResult">查看最近生成结果</button>
+      </div>
+      <div class="app-passwords-secret" id="appPasswordsSecretPanel" hidden>
+        <div><span class="app-passwords-secret-label">App 专用密码</span><code id="appPasswordsSecret" aria-label="App 专用密码"></code></div>
+        <div class="app-passwords-secret-actions"><button type="button" class="button button-light" id="appPasswordsCopy">复制密码</button><button type="button" class="text-button" id="appPasswordsHide">隐藏并清除</button></div>
+      </div>
+      <div class="app-passwords-list-wrap">
+        <div class="app-passwords-list-heading"><strong>已创建的密码</strong><span>列表不显示密码内容</span></div>
+        <ul class="app-passwords-list" id="appPasswordsItems" aria-label="App 专用密码列表"></ul>
+        <p class="app-passwords-empty" id="appPasswordsEmpty">读取后显示当前账号的密码标签。</p>
+      </div>
+      <div class="app-passwords-review" id="appPasswordsReview">
+        <p>上次新建结果待核对。先读取列表，确认状态后再解除本机阻挡。</p>
+        <label class="primary-mail-check" for="appPasswordsReviewConfirm"><input id="appPasswordsReviewConfirm" type="checkbox">我已核对列表，允许新建。</label>
+        <button type="button" class="button button-light" id="appPasswordsReviewButton">确认解锁新建</button>
+      </div>
+    </div>
   </section>
   <section class="request-card overview-only hme-card" id="hmeCard" hidden>
     <div class="card-title-row"><div><span class="card-kicker">iCloud+ 子号工具</span><h3>隐藏邮件地址</h3></div><div class="commerce-actions"><button id="hmeReconnectButton" class="text-button" type="button">重新连接当前账号</button><button class="text-button" id="hmeListButton">读取地址</button><button class="text-button hme-create-button" id="hmeGenerateButton">＋ 生成候选</button></div></div>

@@ -214,6 +214,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.handleDeviceCode(w, r)
 	case "/v1/primary-mail/status", "/v1/primary-mail/create":
 		g.handlePrimaryMail(w, r)
+	case "/v1/app-passwords/status", "/v1/app-passwords/connect", "/v1/app-passwords/create", "/v1/app-passwords/result", "/v1/app-passwords/review":
+		g.handleAppPasswords(w, r)
 	default:
 		writeJSON(w, http.StatusNotFound, errorReply{OK: false, Stage: "not_found", Message: "接口不存在"})
 	}

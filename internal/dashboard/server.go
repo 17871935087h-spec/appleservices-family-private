@@ -63,6 +63,7 @@ type Server struct {
 	familyRemovalUnknown   map[string]bool
 	primaryMailRunner      func(context.Context, *Account, primaryMailInput) primaryMailState
 	familyCredentialLoader func(string, string) (string, error)
+	appPasswords           *appPasswordService
 }
 type Status struct {
 	PID                  int       `json:"pid"`
@@ -142,6 +143,7 @@ func New(config Config) (*Server, error) {
 	s := &Server{config: config, listener: listener, token: hex.EncodeToString(key), familyRosterKey: base64.RawURLEncoding.EncodeToString(refKey)}
 	clear(refKey)
 	s.provisionMacPush = s.runMacPushProvisioner
+	s.appPasswords = newAppPasswordService(s)
 	if entries, err := loadRegistry(config.Dir, config.Dir); err != nil {
 		// Surfaced rather than swallowed: an unreadable registry previously
 		// made the panel look like it had no accounts at all.
@@ -1282,6 +1284,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if s.handlePrimaryMailAPI(w, r) {
 			return
 		}
+		if s.handleAppPasswordsAPI(w, r) {
+			return
+		}
 		switch {
 		case r.Method == "GET" && r.URL.Path == "/api/view":
 			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
@@ -1503,6 +1508,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	case "/primary-mail.css":
 		file = "primary-mail.css"
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	case "/app-passwords.js":
+		file = "app-passwords.js"
+		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	case "/app-passwords.css":
+		file = "app-passwords.css"
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
 	default:
 		http.NotFound(w, r)
