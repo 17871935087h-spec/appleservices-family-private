@@ -486,6 +486,22 @@ func (p *appPasswordService) run(ctx context.Context, account *Account, action s
 		}
 	}
 	if action == "connect" && stage == "session_required" {
+		if hasSession && !invalidSessionCache {
+			if state.FailurePhase != "list" || state.HTTPStatus != http.StatusUnauthorized {
+				state.Stage = "session_required"
+				return state
+			}
+			// A confirmed expired session was restored into this client. Start
+			// authorized authentication with a new cookie jar and no stale portal
+			// SCNT/API key, while retaining the saved result and old cache until
+			// authentication succeeds. Risk responses never enter this branch.
+			client, err = p.newClient(account.AppleID)
+			if err != nil {
+				state.Stage = "unavailable"
+				setAppPasswordLocalFailure(&state, "client_init", err)
+				return state
+			}
+		}
 		clearAppPasswordFailure(&state)
 		password, passwordErr := p.loadPassword(account.Dir, account.AppleID)
 		if passwordErr != nil {

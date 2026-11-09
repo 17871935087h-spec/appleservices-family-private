@@ -357,6 +357,74 @@ func TestAppPasswordConnectIsExplicitAndBoundToSelectedDevice(t *testing.T) {
 	}
 }
 
+func TestAppPasswordExpiredSessionConnectAuthenticatesFreshClientWithSelectedDevice(t *testing.T) {
+	s, a, expired, m, credentials, codes := appPasswordFixture(t)
+	fixtureManagementSession(t, m, a)
+	expired.listErr = &icloud.AppPasswordError{Stage: "session_required", HTTPStatus: 401}
+	fresh := &fixtureAppPasswordClient{}
+	clients := 0
+	s.appPasswords.newClient = func(id string) (appPasswordClient, error) {
+		clients++
+		if id != a.AppleID {
+			t.Fatal("fresh authentication changed account")
+		}
+		if clients == 1 {
+			return expired, nil
+		}
+		if clients != 2 {
+			t.Fatal("authentication was retried")
+		}
+		return fresh, nil
+	}
+	got := s.appPasswords.run(context.Background(), a, "connect", appPasswordInput{AllowWebLogin: true, AllowDeviceVerification: true})
+	if got.Stage != "ready" || !got.CanCreate || got.FailurePhase != "" || got.HTTPStatus != 0 ||
+		clients != 2 || expired.restores != 1 || expired.lists != 1 || expired.auths != 0 ||
+		fresh.restores != 0 || fresh.auths != 1 || fresh.lists != 1 || *credentials != 1 || *codes != 1 {
+		t.Fatalf("expired client leaked into reauthentication: stage=%s clients=%d old-auth=%d fresh-auth=%d codes=%d",
+			got.Stage, clients, expired.auths, fresh.auths, *codes)
+	}
+	if string(m.data[a.AppleID+"/app-password-session"]) != "fixture management session" {
+		t.Fatal("fresh authenticated session was not persisted")
+	}
+}
+
+func TestAppPasswordConnectDoesNotRebuildOrAuthenticateOnRiskResponse(t *testing.T) {
+	s, a, c, m, credentials, codes := appPasswordFixture(t)
+	fixtureManagementSession(t, m, a)
+	c.listErr = &icloud.AppPasswordError{Stage: "risk_blocked", HTTPStatus: 403}
+	got := s.appPasswords.run(context.Background(), a, "connect", appPasswordInput{AllowWebLogin: true, AllowDeviceVerification: true})
+	if got.Stage != "risk_blocked" || got.FailurePhase != "list" || got.HTTPStatus != 403 ||
+		c.newClients != 1 || c.restores != 1 || c.lists != 1 || c.auths != 0 || *credentials != 0 || *codes != 0 {
+		t.Fatal("risk response triggered another authentication attempt")
+	}
+	if string(m.data[a.AppleID+"/app-password-session"]) != "fixture" {
+		t.Fatal("risk response overwrote the prior session")
+	}
+}
+
+func TestAppPasswordExpiredSessionFreshAuthenticationFailurePreservesSavedState(t *testing.T) {
+	s, a, expired, m, credentials, codes := appPasswordFixture(t)
+	fixtureManagementSession(t, m, a)
+	expired.listErr = &icloud.AppPasswordError{Stage: "session_required", HTTPStatus: 401}
+	fresh := &fixtureAppPasswordClient{authenticateErr: errors.New("synthetic rejection"), failurePhase: "srp-complete", failureStatus: 403}
+	clients := 0
+	s.appPasswords.newClient = func(string) (appPasswordClient, error) {
+		clients++
+		if clients == 1 {
+			return expired, nil
+		}
+		return fresh, nil
+	}
+	got := s.appPasswords.run(context.Background(), a, "connect", appPasswordInput{AllowWebLogin: true, AllowDeviceVerification: true})
+	if got.Stage != "risk_blocked" || got.FailurePhase != "srp-complete" || got.HTTPStatus != 403 ||
+		clients != 2 || expired.auths != 0 || fresh.auths != 1 || fresh.lists != 0 || *credentials != 1 || *codes != 0 {
+		t.Fatal("failed fresh authentication retried or called device code before challenge")
+	}
+	if string(m.data[a.AppleID+"/app-password-session"]) != "fixture" {
+		t.Fatal("failed authentication overwrote the prior cache")
+	}
+}
+
 func TestAppPasswordCreateIsDurablyIdempotentAndRecoverable(t *testing.T) {
 	s, a, c, m, credentials, codes := appPasswordFixture(t)
 	fixtureManagementSession(t, m, a)
