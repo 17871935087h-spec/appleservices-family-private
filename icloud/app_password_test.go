@@ -74,6 +74,47 @@ func requireAppPasswordError(t *testing.T, err error, stage string, status int) 
 	return appError
 }
 
+func TestListAppPasswordsAcceptsAuthenticatedEmptyObjectCollection(t *testing.T) {
+	requests := 0
+	client, _ := newAppPasswordTestClient(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		if request.Method != http.MethodGet || request.URL.Path != appPasswordEndpoint || request.Header.Get("X-Apple-Api-Key") != "test-api-key" {
+			t.Fatal("empty collection was not read through the authenticated GET")
+		}
+		writeAppPasswordJSON(writer, http.StatusOK, "{}\n")
+	}))
+	entries, err := client.ListAppPasswords(context.Background())
+	if err != nil || entries == nil || len(entries) != 0 || requests != 1 {
+		t.Fatal("Apple's empty collection representation was rejected")
+	}
+}
+
+func TestEmptyAppPasswordCollectionDoesNotAcceptIncompleteOrErrorResponses(t *testing.T) {
+	for _, body := range []string{`null`, `{"data":{}}`, `{"data":null}`, `{"error":{}}`, `{"success":false}`, `{"status":500}`, `{"message":"unavailable"}`} {
+		t.Run(body, func(t *testing.T) {
+			client, _ := newAppPasswordTestClient(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.Method != http.MethodGet {
+					t.Fatal("list sent a mutation")
+				}
+				writeAppPasswordJSON(writer, http.StatusOK, body)
+			}))
+			_, err := client.ListAppPasswords(context.Background())
+			requireAppPasswordError(t, err, "unavailable", http.StatusOK)
+		})
+	}
+	client, _ := newAppPasswordTestClient(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != appPasswordEndpoint {
+			t.Fatal("unexpected creation request")
+		}
+		writeAppPasswordJSON(writer, http.StatusOK, `{}`)
+	}))
+	result, err := client.CreateAppPassword(context.Background(), "Mail client", "")
+	requireAppPasswordError(t, err, "outcome_unknown", http.StatusOK)
+	if result != nil {
+		t.Fatal("empty collection was accepted as a successful creation")
+	}
+}
+
 func TestListAppPasswordsUsesOnlyAuthenticatedGET(t *testing.T) {
 	requests := 0
 	client, _ := newAppPasswordTestClient(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

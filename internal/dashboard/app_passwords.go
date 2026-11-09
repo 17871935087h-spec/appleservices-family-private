@@ -40,6 +40,8 @@ type appPasswordState struct {
 	Message         string                    `json:"message"`
 	CanCreate       bool                      `json:"can_create"`
 	Items           []icloud.AppPasswordEntry `json:"items"`
+	FailurePhase    string                    `json:"failure_phase,omitempty"`
+	HTTPStatus      int                       `json:"http_status"`
 	RequestID       string                    `json:"request_id,omitempty"`
 	ResultAvailable bool                      `json:"result_available"`
 	Password        string                    `json:"password,omitempty"`
@@ -79,6 +81,61 @@ type appPasswordService struct {
 
 var appPasswordRequestID = regexp.MustCompile(`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`)
 var appPasswordSecret = regexp.MustCompile(`^[a-zA-Z]{4}(-[a-zA-Z]{4}){3}$`)
+
+func validAppPasswordAuthenticationFailurePhase(value string) bool {
+	switch value {
+	case "bootstrap", "authorize", "federate", "srp-init", "srp-complete", "trusted-challenge", "trusted-code", "trust-session", "oauth-validate", "portal-token", "manage-data":
+		return true
+	default:
+		return false
+	}
+}
+
+func validAppPasswordLocalFailurePhase(value string) bool {
+	switch value {
+	case "client_init", "records_load", "session_load", "session_restore", "credential_load", "list", "session_save":
+		return true
+	default:
+		return false
+	}
+}
+
+func setAppPasswordFailure(state *appPasswordState, phase string, status int) {
+	if state == nil {
+		return
+	}
+	if validAppPasswordAuthenticationFailurePhase(phase) || validAppPasswordLocalFailurePhase(phase) {
+		state.FailurePhase = phase
+	} else {
+		state.FailurePhase = ""
+	}
+	if status >= 100 && status <= 599 {
+		state.HTTPStatus = status
+	} else {
+		state.HTTPStatus = 0
+	}
+}
+
+func setAppPasswordLocalFailure(state *appPasswordState, phase string, err error) {
+	status := 0
+	var detail *icloud.AppPasswordError
+	if errors.As(err, &detail) && detail != nil {
+		status = detail.HTTPStatus
+	}
+	setAppPasswordFailure(state, phase, status)
+}
+
+func clearAppPasswordFailure(state *appPasswordState) {
+	if state != nil {
+		state.FailurePhase = ""
+		state.HTTPStatus = 0
+	}
+}
+
+func invalidAppPasswordSessionCache(err error) bool {
+	var detail *icloud.AppPasswordError
+	return errors.As(err, &detail) && detail != nil && detail.Stage == "invalid_request"
+}
 
 func validAppPasswordDescription(value string) bool {
 	if value == "" || value != strings.TrimSpace(value) || !utf8.ValidString(value) || utf8.RuneCountInString(value) > 64 {
@@ -294,6 +351,7 @@ func (p *appPasswordService) run(ctx context.Context, account *Account, action s
 	defer lock.Unlock()
 	ledger, result, err := p.readRecords(account)
 	if err != nil {
+		setAppPasswordLocalFailure(&state, "records_load", err)
 		return state
 	}
 	var current *appPasswordIntent
@@ -379,42 +437,73 @@ func (p *appPasswordService) run(ctx context.Context, account *Account, action s
 	}
 	client, err := p.newClient(account.AppleID)
 	if err != nil {
+		setAppPasswordLocalFailure(&state, "client_init", err)
 		return state
 	}
 	data, err := p.loadBlob(account.Dir, account.AppleID, "app-password-session")
 	hasSession := err == nil
 	if err != nil && !errors.Is(err, credentialvault.ErrNotFound) {
+		setAppPasswordLocalFailure(&state, "session_load", err)
 		return state
 	}
+	invalidSessionCache := false
 	if hasSession {
 		err = client.RestoreAccountSession(data)
 		clear(data)
 		if err != nil {
-			return state
+			if !invalidAppPasswordSessionCache(err) {
+				setAppPasswordLocalFailure(&state, "session_restore", err)
+				return state
+			}
+			invalidSessionCache = true
+			setAppPasswordLocalFailure(&state, "session_restore", err)
+			if action != "connect" {
+				if state.Stage != "outcome_unknown" {
+					state.Stage = "session_required"
+				}
+				return state
+			}
+			state.Stage = "session_required"
+			// Restore may have partially initialized a client before rejecting a
+			// malformed cache. Recreate it before the one authorized login attempt.
+			client, err = p.newClient(account.AppleID)
+			if err != nil {
+				state.Stage = "unavailable"
+				setAppPasswordLocalFailure(&state, "client_init", err)
+				return state
+			}
 		}
 	}
 	var items []icloud.AppPasswordEntry
 	stage := "session_required"
-	if hasSession {
+	if hasSession && !invalidSessionCache {
 		items, err = client.ListAppPasswords(ctx)
 		if err == nil {
 			stage = "ready"
 		} else {
 			stage = appPasswordFailure(err)
+			setAppPasswordLocalFailure(&state, "list", err)
 		}
 	}
 	if action == "connect" && stage == "session_required" {
+		clearAppPasswordFailure(&state)
 		password, passwordErr := p.loadPassword(account.Dir, account.AppleID)
 		if passwordErr != nil {
 			state.Stage = "credential_required"
+			setAppPasswordLocalFailure(&state, "credential_load", passwordErr)
 			return state
 		}
 		err = client.Authenticate(ctx, password, func(codeCtx context.Context) (string, error) { return p.deviceCode(codeCtx, account) })
 		password = ""
 		if err != nil {
 			failure, status := client.AuthenticationFailure()
+			phase := failure
+			if !validAppPasswordAuthenticationFailurePhase(phase) {
+				phase = ""
+			}
+			setAppPasswordFailure(&state, phase, status)
 			state.Stage = "unavailable"
-			if strings.HasPrefix(failure, "trusted-") || status == http.StatusConflict {
+			if phase == "trusted-challenge" || phase == "trusted-code" || status == http.StatusConflict {
 				state.Stage = "verification_required"
 			} else if status == 401 || status == 403 || status == 423 || status == 429 {
 				state.Stage = "risk_blocked"
@@ -423,15 +512,28 @@ func (p *appPasswordService) run(ctx context.Context, account *Account, action s
 			}
 			return state
 		}
+		// Persist the freshly established management session before any later
+		// read can fail while decoding Apple's response. A successful list is
+		// saved again below so any refreshed SCNT is retained as well.
+		if err := p.saveSession(account, client); err != nil {
+			state.Stage = "unavailable"
+			setAppPasswordLocalFailure(&state, "session_save", err)
+			return state
+		}
 		items, err = client.ListAppPasswords(ctx)
 		if err == nil {
 			stage = "ready"
 		} else {
 			stage = appPasswordFailure(err)
+			setAppPasswordLocalFailure(&state, "list", err)
+		}
+		if err == nil {
+			clearAppPasswordFailure(&state)
 		}
 	}
 	if stage == "ready" {
-		if p.saveSession(account, client) != nil {
+		if err := p.saveSession(account, client); err != nil {
+			setAppPasswordLocalFailure(&state, "session_save", err)
 			if unresolved == nil {
 				state.Stage = "unavailable"
 			}
@@ -472,6 +574,7 @@ func (p *appPasswordService) run(ctx context.Context, account *Account, action s
 		if err != nil {
 			state.Stage = "credential_required"
 			state.CanCreate = false
+			setAppPasswordLocalFailure(&state, "credential_load", err)
 			return state
 		}
 	}
@@ -509,7 +612,9 @@ func (p *appPasswordService) run(ctx context.Context, account *Account, action s
 		}
 		state.Stage = stage
 		state.CanCreate = stage == "password_required"
-		_ = p.saveSession(account, client)
+		if err := p.saveSession(account, client); err != nil {
+			setAppPasswordLocalFailure(&state, "session_save", err)
+		}
 		return state
 	}
 	if generated == nil || !appPasswordSecret.MatchString(generated.Password) {
@@ -523,7 +628,9 @@ func (p *appPasswordService) run(ctx context.Context, account *Account, action s
 	}
 	current.Stage = "generated"
 	_ = p.saveJSON(account, "app-password-intent", ledger)
-	_ = p.saveSession(account, client)
+	if err := p.saveSession(account, client); err != nil {
+		setAppPasswordLocalFailure(&state, "session_save", err)
+	}
 	state.Stage = "generated"
 	state.CanCreate = true
 	state.ResultAvailable = true

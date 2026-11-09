@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -43,12 +44,83 @@ func TestAppPasswordsBindsAccountAndKeepsStatusReadOnly(t *testing.T) {
 	if response.Code != http.StatusOK || statusCalls != 1 || createCalls != 0 || state.Stage != "ready" || !state.CanCreate || state.Message != appPasswordMessage("ready") || len(state.Items) != 1 {
 		t.Fatalf("safe read projection failed: status=%d calls=%d state=%#v", response.Code, statusCalls, state)
 	}
+	if state.FailurePhase != nil || state.HTTPStatus != nil {
+		t.Fatalf("legacy dashboard response should remain compatible without diagnostics: %#v", state)
+	}
 	if strings.Contains(response.Body.String(), "raw-secret-fixture") || strings.Contains(response.Body.String(), "password") {
 		t.Fatalf("dashboard text or password crossed response boundary: %s", response.Body.String())
 	}
 	response = gatewayRequest(t, g, "/v1/app-passwords/status", `{"account_id":"org-01","apple_id":"other@example.test"}`)
 	if response.Code != http.StatusNotFound || statusCalls != 1 {
 		t.Fatal("mismatched account reached dashboard")
+	}
+}
+
+func TestAppPasswordsPassesAllowlistedFailureDiagnosticsWithoutRawErrors(t *testing.T) {
+	for _, test := range []struct {
+		name, phase string
+		status      int
+	}{
+		{name: "dashboard phase", phase: "trusted-code", status: 401},
+		{name: "local phase with zero status", phase: "records_load", status: 0},
+		{name: "lower HTTP boundary", phase: "bootstrap", status: 100},
+		{name: "upper HTTP boundary", phase: "session_save", status: 599},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/" {
+					_, _ = io.WriteString(w, `<meta name="app-token" content="`+testAppKey+`">`)
+					return
+				}
+				body := `{"account_id":"org-01","stage":"verification_required","message":"raw authentication response and secret","can_create":false,"items":[],"failure_phase":"` + test.phase + `","http_status":` + strconv.Itoa(test.status) + `}`
+				_, _ = io.WriteString(w, body)
+			}))
+			defer server.Close()
+			g := newAppPasswordTestGateway(t, server)
+			response := gatewayRequest(t, g, "/v1/app-passwords/status", `{"account_id":"org-01","apple_id":"organizer@example.test"}`)
+			state := decodeGatewayResponse[appPasswordReply](t, response)
+			if response.Code != http.StatusOK || state.Stage != "verification_required" ||
+				state.FailurePhase == nil || *state.FailurePhase != test.phase ||
+				state.HTTPStatus == nil || *state.HTTPStatus != test.status {
+				t.Fatalf("allowlisted diagnostics were not preserved: status=%d state=%#v", response.Code, state)
+			}
+			if state.Message != appPasswordMessage(state.Stage) || strings.Contains(response.Body.String(), "raw authentication response and secret") {
+				t.Fatalf("raw dashboard error crossed response boundary: %s", response.Body.String())
+			}
+		})
+	}
+}
+
+func TestAppPasswordsRejectsInvalidFailureDiagnostics(t *testing.T) {
+	for _, test := range []struct {
+		name, diagnostics string
+	}{
+		{name: "unknown phase", diagnostics: `,"failure_phase":"raw-auth-error-secret","http_status":401`},
+		{name: "empty phase", diagnostics: `,"failure_phase":"","http_status":401`},
+		{name: "low HTTP status", diagnostics: `,"failure_phase":"oauth-validate","http_status":99`},
+		{name: "high HTTP status", diagnostics: `,"failure_phase":"oauth-validate","http_status":600`},
+		{name: "non-integer HTTP status", diagnostics: `,"failure_phase":"oauth-validate","http_status":"401"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/" {
+					_, _ = io.WriteString(w, `<meta name="app-token" content="`+testAppKey+`">`)
+					return
+				}
+				body := `{"account_id":"org-01","stage":"ready","message":"raw-auth-error-secret","can_create":true,"items":[]` + test.diagnostics + `}`
+				_, _ = io.WriteString(w, body)
+			}))
+			defer server.Close()
+			g := newAppPasswordTestGateway(t, server)
+			response := gatewayRequest(t, g, "/v1/app-passwords/status", `{"account_id":"org-01","apple_id":"organizer@example.test"}`)
+			state := decodeGatewayResponse[appPasswordReply](t, response)
+			if response.Code != http.StatusOK || state.Stage != "unavailable" || state.FailurePhase != nil || state.HTTPStatus != nil {
+				t.Fatalf("invalid diagnostics were not rejected safely: status=%d state=%#v", response.Code, state)
+			}
+			if strings.Contains(response.Body.String(), "raw-auth-error-secret") {
+				t.Fatalf("raw diagnostic or error crossed response boundary: %s", response.Body.String())
+			}
+		})
 	}
 }
 

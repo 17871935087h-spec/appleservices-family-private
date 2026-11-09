@@ -437,6 +437,12 @@ func findAppPasswordArray(data []byte, depth int) ([]json.RawMessage, bool) {
 	if json.Unmarshal(data, &object) != nil || object == nil {
 		return nil, false
 	}
+	// The authenticated collection endpoint returns an empty object when the
+	// account has no app-specific passwords. Only the top-level empty object
+	// is this empty-list representation; missing nested lists remain invalid.
+	if depth == 0 && len(object) == 0 {
+		return []json.RawMessage{}, true
+	}
 	for _, key := range []string{"secondaryPasswords", "appSpecificPasswords", "appPasswords", "passwords", "items", "data"} {
 		child, ok := appPasswordRawField(object, key)
 		if !ok {

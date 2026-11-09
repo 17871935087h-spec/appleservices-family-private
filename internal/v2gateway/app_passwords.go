@@ -45,6 +45,8 @@ type appPasswordReply struct {
 	ResultAvailable bool              `json:"result_available,omitempty"`
 	Password        string            `json:"password,omitempty"`
 	Description     string            `json:"description,omitempty"`
+	FailurePhase    *string           `json:"failure_phase,omitempty"`
+	HTTPStatus      *int              `json:"http_status,omitempty"`
 }
 
 func (g *Gateway) handleAppPasswords(w http.ResponseWriter, r *http.Request) {
@@ -318,6 +320,12 @@ func validAppPasswordResponse(result appPasswordReply, input appPasswordRequest,
 	if result.AccountID != input.AccountID || len(result.Items) > 128 {
 		return false
 	}
+	if result.FailurePhase != nil && !validAppPasswordFailurePhase(*result.FailurePhase) {
+		return false
+	}
+	if result.HTTPStatus != nil && !validAppPasswordHTTPStatus(*result.HTTPStatus) {
+		return false
+	}
 	switch result.Stage {
 	case "session_required", "ready", "generated", "password_required", "verification_required", "risk_blocked", "terms_required", "credential_required", "outcome_unknown", "busy", "invalid_request", "unavailable":
 	default:
@@ -380,6 +388,22 @@ func validAppPasswordCreatedAt(value string) bool {
 	return utf8.ValidString(value) && utf8.RuneCountInString(value) <= 128 && !strings.ContainsFunc(value, unicode.IsControl)
 }
 
+func validAppPasswordFailurePhase(value string) bool {
+	switch value {
+	case "bootstrap", "authorize", "federate", "srp-init", "srp-complete",
+		"trusted-challenge", "trusted-code", "trust-session", "oauth-validate",
+		"portal-token", "manage-data", "client_init", "records_load", "session_load",
+		"session_restore", "credential_load", "list", "session_save":
+		return true
+	default:
+		return false
+	}
+}
+
+func validAppPasswordHTTPStatus(value int) bool {
+	return value == 0 || value >= 100 && value <= 599
+}
+
 func unavailableAppPasswords(accountID, stage, requestID string) appPasswordReply {
 	return appPasswordReply{AccountID: accountID, Stage: stage, Message: appPasswordMessage(stage), Items: []appPasswordItem{}, RequestID: requestID}
 }
@@ -424,6 +448,14 @@ func clearAppPasswordReply(reply *appPasswordReply) {
 		return
 	}
 	reply.Password = ""
+	if reply.FailurePhase != nil {
+		*reply.FailurePhase = ""
+	}
+	reply.FailurePhase = nil
+	if reply.HTTPStatus != nil {
+		*reply.HTTPStatus = 0
+	}
+	reply.HTTPStatus = nil
 	for index := range reply.Items {
 		reply.Items[index] = appPasswordItem{}
 	}
