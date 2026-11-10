@@ -1367,9 +1367,11 @@ def perform_create(context, request, native_before, services):
             "mail_service_present": web_after.get("mail_service_present") is True,
         }
         native_after = services.native_read(context, request)
+        # isCKMail can remain false even after activateEmail and the bound native
+        # account settings both confirm the exact mailbox. Keep it as diagnostic
+        # metadata; it must not veto the authoritative native readback.
         confirmed = (
             record["activation_reply_matches_target"] is True
-            and web_after.get("mail_flag") is True
             and web_after.get("mail_service_present") is True
             and exact_primary_match(native_after, target)
         )

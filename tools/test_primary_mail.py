@@ -675,6 +675,29 @@ class PrimaryMailTests(unittest.TestCase):
         self.assertTrue(record["native_readback_matches_target"])
         self.assertNotIn("primary_email_matches_target", record["web_after"])
 
+    def test_exact_native_confirmation_succeeds_when_ckmail_flag_stays_false(self):
+        target = "sample@icloud.com"
+        web = FakeWebClient({}, [
+            {"mail_service_present": False, "mail_flag": False,
+             "primary_email_matches_target": False},
+            {"mail_service_present": True, "mail_flag": False,
+             "primary_email_matches_target": False},
+        ])
+        services = FakeServices([native_empty(), native_present(target)], web)
+
+        result = primary_mail.run_request(
+            self.request("create", prefix="sample", confirm_permanent=True,
+                         allow_web_login=False), services,
+        )
+
+        self.assertEqual(result["stage"], "verified")
+        self.assertEqual(result["email"], target)
+        self.assertEqual(web.activation_seen, 1)
+        record = json.loads((self.account / "primary-mail" / "operation.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["stage"], "verified")
+        self.assertFalse(record["web_after"]["mail_flag"])
+        self.assertTrue(record["native_readback_matches_target"])
+
     def test_legacy_me_and_mac_addresses_are_unavailable_not_open(self):
         for address in ("old@me.com", "old@mac.com"):
             reply = primary_mail.NativeReply(200, json.dumps({
