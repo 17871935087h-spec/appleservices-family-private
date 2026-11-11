@@ -40,6 +40,8 @@ func primaryMailMessage(stage string) string {
 		return "尚未开通 iCloud 主邮箱"
 	case "web_login_required":
 		return "需要授权使用已保存密码和受信任设备建立 iCloud 网页会话"
+	case "native_session_required":
+		return "Windows iCloud 服务会话需要恢复（原生查询未获认证）"
 	case "verification_required":
 		return "设备验证未完成，请在官方设备处理后读取状态"
 	case "terms_required":
@@ -62,7 +64,7 @@ func sanitizePrimaryMail(value primaryMailState, account string) primaryMailStat
 		return primaryMailState{AccountID: account, Stage: "unavailable", Message: primaryMailMessage("unavailable")}
 	}
 	switch value.Stage {
-	case "unknown", "not_open", "verified", "outcome_unknown", "web_login_required", "verification_required", "terms_required", "risk_blocked", "unavailable", "busy", "invalid_request":
+	case "unknown", "not_open", "verified", "outcome_unknown", "web_login_required", "native_session_required", "verification_required", "terms_required", "risk_blocked", "unavailable", "busy", "invalid_request":
 	default:
 		value.Stage = "unavailable"
 	}

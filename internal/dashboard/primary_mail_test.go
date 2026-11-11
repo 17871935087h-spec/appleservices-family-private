@@ -59,3 +59,15 @@ func TestPrimaryMailProjectionRejectsWrongAccountAndFalseVerified(t *testing.T) 
 		t.Fatal("unsafe retry or message")
 	}
 }
+
+func TestPrimaryMailProjectionKeepsNativeSessionRequiredNonCreatable(t *testing.T) {
+	got := sanitizePrimaryMail(primaryMailState{
+		AccountID: "fixture", Stage: "native_session_required", CanCreate: true, Message: "raw secret",
+	}, "fixture")
+	if got.Stage != "native_session_required" || got.CanCreate {
+		t.Fatal("native session failure must remain non-creatable")
+	}
+	if got.Message != "Windows iCloud 服务会话需要恢复（原生查询未获认证）" {
+		t.Fatal("native session diagnostic message was not fixed")
+	}
+}

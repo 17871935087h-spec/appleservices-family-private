@@ -596,6 +596,52 @@ class PrimaryMailTests(unittest.TestCase):
         self.assertEqual(result["email"], address)
         self.assertFalse(result["can_create"])
 
+    def test_native_401_requires_session_while_explicit_lock_and_403_429_stay_blocked(self):
+        unauthorized = native_unknown()
+        unauthorized.update(http_status=401, parsed=True, business_error=True)
+        self.assertEqual(primary_mail.stage_from_native(unauthorized), "native_session_required")
+        self.assertEqual(
+            primary_mail.stage_from_native({**unauthorized, "account_locked": True}),
+            "risk_blocked",
+        )
+        for status in (403, 429):
+            with self.subTest(http_status=status):
+                rejected = native_unknown()
+                rejected["http_status"] = status
+                self.assertEqual(primary_mail.stage_from_native(rejected), "risk_blocked")
+
+        reply = primary_mail.make_reply(
+            "acct-1", "native_session_required", can_create=True,
+        )
+        self.assertFalse(reply["can_create"])
+        self.assertEqual(
+            reply["message"], "Windows iCloud 服务会话需要恢复（原生查询未获认证）",
+        )
+
+    def test_native_401_status_and_create_never_login_or_write_intent(self):
+        unauthorized = native_unknown()
+        unauthorized.update(http_status=401, parsed=True, business_error=True)
+
+        status_services = FakeServices([unauthorized])
+        status = primary_mail.run_request(self.request(), status_services)
+        self.assertEqual(status["stage"], "native_session_required")
+        self.assertFalse(status["can_create"])
+        self.assertEqual(status_services.session_calls, 0)
+
+        create_services = FakeServices([unauthorized])
+        created = primary_mail.run_request(
+            self.request(
+                "create", prefix="sample", confirm_permanent=True,
+                allow_web_login=True,
+            ),
+            create_services,
+        )
+        self.assertEqual(created["stage"], "native_session_required")
+        self.assertFalse(created["can_create"])
+        self.assertEqual(create_services.session_calls, 0)
+        self.assertFalse((self.account / "primary-mail" / "operation.json").exists())
+        self.assertFalse((self.account / "primary-mail" / "login-intent.json").exists())
+
     def test_create_requires_permanent_confirmation(self):
         services = FakeServices([native_empty()])
         result = primary_mail.run_request(

@@ -129,7 +129,7 @@ func (g *Gateway) primaryMailDashboard(ctx context.Context, input primaryMailReq
 		return primaryMailState{}, io.ErrUnexpectedEOF
 	}
 	switch result.Stage {
-	case "unknown", "not_open", "verified", "outcome_unknown", "web_login_required", "verification_required", "terms_required", "risk_blocked", "unavailable", "busy", "invalid_request":
+	case "unknown", "not_open", "verified", "outcome_unknown", "web_login_required", "native_session_required", "verification_required", "terms_required", "risk_blocked", "unavailable", "busy", "invalid_request":
 	default:
 		return primaryMailState{}, io.ErrUnexpectedEOF
 	}
@@ -142,6 +142,8 @@ func (g *Gateway) primaryMailDashboard(ctx context.Context, input primaryMailReq
 		result.Message = "iCloud 主邮箱已开通，已回读确认"
 	} else if result.Stage == "outcome_unknown" {
 		result.Message = "创建结果待核验，请读取状态，勿重复提交"
+	} else if result.Stage == "native_session_required" {
+		result.Message = "Windows iCloud 服务会话需要恢复（原生查询未获认证）"
 	}
 	return result, nil
 }

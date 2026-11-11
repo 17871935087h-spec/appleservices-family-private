@@ -35,7 +35,7 @@ CREDENTIAL_HEADER = b"ASCV\x00\x01\x00\x00"
 CREDENTIAL_ENTROPY_PREFIX = b"github.com/Laky-64/appleservices/credentialvault/v1\x00"
 ALLOWED_STAGES = {
     "unknown", "not_open", "verified", "outcome_unknown",
-    "web_login_required", "verification_required", "terms_required",
+    "web_login_required", "native_session_required", "verification_required", "terms_required",
     "risk_blocked", "unavailable", "busy", "invalid_request",
 }
 MESSAGES = {
@@ -44,6 +44,7 @@ MESSAGES = {
     "verified": "Apple 原生账户设置已确认主邮箱。",
     "outcome_unknown": "创建结果尚未确认；系统只执行回读，不会重发创建请求。",
     "web_login_required": "需要先建立本账号的 iCloud Web 会话。",
+    "native_session_required": "Windows iCloud 服务会话需要恢复（原生查询未获认证）",
     "verification_required": "Apple 要求重新验证；当前操作已停止。",
     "terms_required": "Apple 要求先处理条款；当前操作已停止。",
     "risk_blocked": "Apple 账户状态或已有别名阻止了创建。",
@@ -557,9 +558,11 @@ def read_native_settings(context, request):
 def stage_from_native(settings):
     if settings.get("account_locked") is True:
         return "risk_blocked"
+    if settings.get("http_status") == 401:
+        return "native_session_required"
     if settings.get("unsupported_mail") is True or settings.get("primary_state") == "unsupported":
         return "unavailable"
-    if settings.get("http_status") in (401, 403, 429):
+    if settings.get("http_status") in (403, 429):
         return "risk_blocked"
     if (settings.get("http_status") != 200 or settings.get("parsed") is not True
             or settings.get("account_info_present") is not True
@@ -839,7 +842,8 @@ def make_reply(account_id, stage, email=None, target=None, can_create=False):
     stage = stage if stage in ALLOWED_STAGES else "unavailable"
     result = {
         "account_id": account_id if isinstance(account_id, str) and ACCOUNT_RE.fullmatch(account_id) else "",
-        "stage": stage, "message": MESSAGES[stage], "can_create": bool(can_create),
+        "stage": stage, "message": MESSAGES[stage],
+        "can_create": bool(can_create) and stage != "native_session_required",
         "checked_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     if isinstance(email, str) and MAIL_RE.fullmatch(email):

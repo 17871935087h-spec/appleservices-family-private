@@ -97,3 +97,43 @@ func TestPrimaryMailGatewayDoesNotReplayUnknownCreate(t *testing.T) {
 		t.Fatal("unconfirmed creation reached dashboard")
 	}
 }
+
+func TestPrimaryMailGatewayAllowsNativeSessionStageButRejectsCreatePermission(t *testing.T) {
+	registryPath := testRegistry(t, registryFixture())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			io.WriteString(w, `<meta name="app-token" content="`+testAppKey+`">`)
+			return
+		}
+		json.NewEncoder(w).Encode(primaryMailState{
+			AccountID: "org-01", Stage: "native_session_required", CanCreate: true, Message: "raw-secret-fixture",
+		})
+	}))
+	defer server.Close()
+	g, err := New(Config{RegistryPath: registryPath, IntentDir: testRoot(t), BearerToken: testBearer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	address, _ := url.Parse(server.URL)
+	g.dashboardURL = *address
+	registry, err := loadRegistry(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appleID := ""
+	for _, account := range registry.Accounts {
+		if account.ID == "org-01" {
+			appleID = account.AppleID
+		}
+	}
+	encoded, _ := json.Marshal(primaryMailRequest{AccountID: "org-01", AppleID: appleID})
+	response := gatewayRequest(t, g, "/v1/primary-mail/status", string(encoded))
+	state := decodeGatewayResponse[primaryMailState](t, response)
+	if response.Code != http.StatusOK || state.Stage != "native_session_required" || state.CanCreate {
+		t.Fatal("native session failure stage was lost or made creatable")
+	}
+	if state.Message != "Windows iCloud 服务会话需要恢复（原生查询未获认证）" || strings.Contains(response.Body.String(), "raw-secret-fixture") {
+		t.Fatal("native session diagnostic was not safely projected")
+	}
+}
