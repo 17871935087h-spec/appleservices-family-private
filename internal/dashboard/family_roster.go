@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Laky-64/appleservices/internal/control"
+	"github.com/Laky-64/appleservices/internal/egresspool"
 )
 
 const familyRosterPrefix = "FAMILY_ROSTER_JSON="
@@ -100,7 +101,11 @@ func familyRefEnvironment(key, ref string) []string {
 
 func runFamilyRoster(ctx context.Context, helper, dir, key string) (*control.FamilyRosterProjection, error) {
 	command := exec.CommandContext(ctx, helper, "-dir", dir, "-organizer-roster")
-	command.Env = familyRefEnvironment(key, "")
+	var envErr error
+	command.Env, envErr = egresspool.Environment(familyRefEnvironment(key, ""), dir)
+	if envErr != nil {
+		return nil, envErr
+	}
 	var output bytes.Buffer
 	command.Stdout, command.Stderr = &output, &output
 	if err := command.Run(); err != nil || output.Len() > 128<<10 {
@@ -153,7 +158,11 @@ func parseFamilyRemoveOutcome(output string) (string, error) {
 
 func runFamilyRefRemove(ctx context.Context, helper, dir, key, ref string) (*control.FamilyInfo, string, error) {
 	command := exec.CommandContext(ctx, helper, "-dir", dir, "-remove-member-ref", "-safe-json")
-	command.Env = familyRefEnvironment(key, ref)
+	var envErr error
+	command.Env, envErr = egresspool.Environment(familyRefEnvironment(key, ref), dir)
+	if envErr != nil {
+		return nil, "not_submitted", envErr
+	}
 	var output bytes.Buffer
 	command.Stdout, command.Stderr = &output, &output
 	runErr := command.Run()

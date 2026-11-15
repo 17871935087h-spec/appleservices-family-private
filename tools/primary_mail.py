@@ -6,6 +6,7 @@ import ctypes
 import hashlib
 import http.client
 import http.cookies
+import ipaddress
 import json
 import os
 import re
@@ -22,6 +23,8 @@ from pathlib import Path
 MAX_INPUT = 64 * 1024
 MAX_JSON = 2 * 1024 * 1024
 MAX_HTTP = 4 * 1024 * 1024
+ACCOUNT_PROXY_ENV = "APPLESERVICES_ACCOUNT_PROXY"
+ACCOUNT_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 ACCOUNT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 APPLE_ID_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,189}$")
 MAIL_RE = re.compile(r"^[a-zA-Z0-9._+-]+@icloud\.com$", re.I)
@@ -57,6 +60,103 @@ MESSAGES = {
 class Stop(Exception):
     def __init__(self, stage):
         self.stage = stage if stage in ALLOWED_STAGES else "unavailable"
+
+
+def account_proxy_url():
+    value = os.environ.get(ACCOUNT_PROXY_ENV)
+    if value is None or value == "":
+        if os.environ.get("APPLESERVICES_PROXY_POOL"):
+            raise Stop("unavailable")
+        return None
+    if (value != value.strip() or len(value) > 4096
+            or any(ord(char) < 0x21 or ord(char) == 0x7f for char in value)):
+        raise Stop("unavailable")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError, UnicodeError):
+        raise Stop("unavailable") from None
+    if (parsed.scheme.lower() not in ACCOUNT_PROXY_SCHEMES or not parsed.hostname
+            or port == 0 or (port is not None and not 1 <= port <= 65535)
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment
+            or (parsed.username is not None and (not parsed.username or parsed.password is None))):
+        raise Stop("unavailable")
+    return value
+
+
+def _is_loopback_url(url):
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").rstrip(".").casefold()
+    except (TypeError, ValueError, UnicodeError):
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _account_proxy_response(method, url, body, headers, byte_limit, timeout):
+    # Local dashboard/control IPC must remain direct even when the account has
+    # an outbound proxy. The stdlib-only account-http helper owns proxy
+    # protocols so this -I launched script does not depend on site packages.
+    if _is_loopback_url(url):
+        return None
+    proxy_url = account_proxy_url()
+    if proxy_url is None:
+        return None
+    helper = Path(__file__).resolve().with_name("account-http.exe")
+    proxy_timeout = max(1, min(int(timeout), 30))
+    request_payload = {
+        "method": method,
+        "url": url,
+        "body": base64.b64encode(body or b"").decode("ascii"),
+        "headers": headers,
+        "byte_limit": byte_limit,
+        "timeout_seconds": proxy_timeout,
+    }
+    encoded_request = json.dumps(request_payload, separators=(",", ":")).encode("utf-8") + b"\n"
+    try:
+        completed = subprocess.run(
+            [str(helper)], input=encoded_request, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=proxy_timeout,
+            env=account_proxy_helper_environment(proxy_url),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise Stop("unavailable") from None
+    if completed.returncode != 0 or len(completed.stdout) > 8 * 1024 * 1024:
+        raise Stop("unavailable")
+    try:
+        reply = json.loads(completed.stdout)
+        status = reply.get("status") if isinstance(reply, dict) else None
+        encoded_body = reply.get("body") if isinstance(reply, dict) else None
+        set_cookies = reply.get("set_cookies") if isinstance(reply, dict) else None
+        if type(status) is not int or not 100 <= status <= 599 or not isinstance(encoded_body, str):
+            raise ValueError
+        raw = base64.b64decode(encoded_body, validate=True)
+        if len(raw) > byte_limit or not isinstance(set_cookies, list) or len(set_cookies) > 128:
+            raise ValueError
+        if any(not isinstance(value, str) or len(value) > 8192 or "\r" in value or "\n" in value
+               for value in set_cookies):
+            raise ValueError
+        return status, raw, set_cookies
+    except (ValueError, TypeError, UnicodeError):
+        # Treat helper output as untrusted. Never expose its error text or retry
+        # a failed proxy request through a direct connection.
+        raise Stop("unavailable") from None
+
+
+def account_proxy_helper_environment(proxy_url):
+    allowed = {
+        "PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "COMSPEC",
+        "PATHEXT", "SYSTEMDRIVE", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+    }
+    env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env[ACCOUNT_PROXY_ENV] = proxy_url
+    return env
 
 
 class Context:
@@ -437,8 +537,13 @@ class NativeTransport:
         request_headers = dict(headers)
         auth = base64.b64encode((self.context.dsid + ":" + self.context.token).encode("utf-8")).decode("ascii")
         request_headers["Authorization"] = "Basic " + auth
-        conn = http.client.HTTPSConnection(SETTINGS_HOST, timeout=15, context=ssl.create_default_context())
+        url = "https://" + SETTINGS_HOST + path
         try:
+            proxied = _account_proxy_response(method, url, body, request_headers, MAX_JSON, 15)
+            if proxied is not None:
+                status, raw, _ = proxied
+                return NativeReply(status, raw)
+            conn = http.client.HTTPSConnection(SETTINGS_HOST, timeout=15, context=ssl.create_default_context())
             conn.request(method, path, body=body, headers=request_headers)
             response = conn.getresponse()
             raw = response.read(MAX_JSON + 1)
@@ -450,7 +555,8 @@ class NativeTransport:
         except (OSError, http.client.HTTPException, ssl.SSLError):
             raise Stop("unavailable") from None
         finally:
-            conn.close()
+            if "conn" in locals():
+                conn.close()
 
     def settings(self):
         headers = dict(self.headers)
@@ -689,32 +795,38 @@ class WebClient:
         }
         body = None if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
         try:
-            connection = http.client.HTTPSConnection(
-                target.hostname, timeout=25, context=ssl.create_default_context()
-            )
-            try:
-                parsed_full = urllib.parse.urlsplit(full_url)
-                path = target.path + (("?" + parsed_full.query) if parsed_full.query else "")
-                connection.request(method, path, body=body, headers=headers)
-                response = connection.getresponse()
-                raw = response.read(MAX_HTTP + 1)
-                if len(raw) > MAX_HTTP:
-                    raise Stop("unavailable")
+            proxied = _account_proxy_response(method, full_url, body, headers, MAX_HTTP, 25)
+            if proxied is not None:
+                status, raw, set_cookies = proxied
+            else:
+                connection = http.client.HTTPSConnection(
+                    target.hostname, timeout=25, context=ssl.create_default_context()
+                )
                 try:
-                    document = json.loads(raw)
-                except (ValueError, UnicodeError):
-                    raise Stop("unavailable") from None
-                if not isinstance(document, dict):
-                    raise Stop("unavailable")
-                if response.status in (401, 403, 429):
-                    raise Stop("risk_blocked")
-                error = document.get("errorCode")
-                if response.status < 200 or response.status >= 300 or document.get("success") is False or error not in (None, "", 0, "0"):
-                    raise Stop("unavailable")
-                self._update_cookies(response.headers.get_all("Set-Cookie", []), target.hostname, target.path)
-                return document
-            finally:
-                connection.close()
+                    parsed_full = urllib.parse.urlsplit(full_url)
+                    path = target.path + (("?" + parsed_full.query) if parsed_full.query else "")
+                    connection.request(method, path, body=body, headers=headers)
+                    response = connection.getresponse()
+                    raw = response.read(MAX_HTTP + 1)
+                    if len(raw) > MAX_HTTP:
+                        raise Stop("unavailable")
+                    status = response.status
+                    set_cookies = response.headers.get_all("Set-Cookie", [])
+                finally:
+                    connection.close()
+            try:
+                document = json.loads(raw)
+            except (ValueError, UnicodeError):
+                raise Stop("unavailable") from None
+            if not isinstance(document, dict):
+                raise Stop("unavailable")
+            if status in (401, 403, 429):
+                raise Stop("risk_blocked")
+            error = document.get("errorCode")
+            if status < 200 or status >= 300 or document.get("success") is False or error not in (None, "", 0, "0"):
+                raise Stop("unavailable")
+            self._update_cookies(set_cookies, target.hostname, target.path)
+            return document
         except Stop:
             raise
         except (OSError, http.client.HTTPException, ssl.SSLError, TimeoutError):
@@ -1151,6 +1263,11 @@ def helper_environment(temp_dir):
     env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
     env["TEMP"] = env["TMP"] = str(temp_dir)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    proxy_url = account_proxy_url()
+    if proxy_url is not None:
+        env[ACCOUNT_PROXY_ENV] = proxy_url
+        # The login helper also calls the dashboard over loopback IPC.
+        env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost,::1"
     return env
 
 

@@ -1,6 +1,7 @@
 """Direct HTTPS transport for the purchase skill; payloads stay on private pipes."""
 import base64
 import json
+import os
 from pathlib import Path
 import plistlib
 import re
@@ -12,13 +13,44 @@ import requests
 
 
 PROXY_MARKER = Path(__file__).resolve().parents[1] / ".cache" / "store-proxy-10808.enabled"
+ACCOUNT_PROXY_ENV = "APPLESERVICES_ACCOUNT_PROXY"
+ACCOUNT_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
+
+
+def account_proxy_url():
+    value = os.environ.get(ACCOUNT_PROXY_ENV)
+    if value is None or value == "":
+        if os.environ.get("APPLESERVICES_PROXY_POOL"):
+            raise ValueError("account proxy missing for configured pool")
+        return None
+    if (value != value.strip() or len(value) > 4096
+            or any(ord(char) < 0x21 or ord(char) == 0x7f for char in value)):
+        raise ValueError("invalid account proxy configuration")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError, UnicodeError):
+        raise ValueError("invalid account proxy configuration") from None
+    if (parsed.scheme.lower() not in ACCOUNT_PROXY_SCHEMES or not parsed.hostname
+            or port == 0 or (port is not None and not 1 <= port <= 65535)
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment
+            or (parsed.username is not None and (not parsed.username or parsed.password is None))):
+        raise ValueError("invalid account proxy configuration")
+    return value
 
 
 def configure_transport(session):
     session.trust_env = False
-    if PROXY_MARKER.is_file():
-        proxy = "http://127.0.0.1:10808"
+    session.verify = True
+    proxy = account_proxy_url()
+    if proxy is not None:
+        # A configured account proxy takes precedence over the legacy local
+        # marker. Explicit proxies are applied to every remote request made by
+        # this helper, including the Store bag lookup; failures are fatal.
         session.proxies.update({"http": proxy, "https": proxy})
+    elif PROXY_MARKER.is_file():
+        local_proxy = "http://127.0.0.1:10808"
+        session.proxies.update({"http": local_proxy, "https": local_proxy})
 
 
 def main():

@@ -9,8 +9,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 
+	"github.com/Laky-64/appleservices/internal/egresspool"
 	"golang.org/x/net/proxy"
 )
 
@@ -22,17 +25,86 @@ type bufferedConnection struct {
 func (c *bufferedConnection) Read(data []byte) (int, error) { return c.reader.Read(data) }
 
 func dialCourier(ctx context.Context, address string) (net.Conn, error) {
-	dialer := &net.Dialer{Timeout: 20 * time.Second}
-	endpoint := &url.URL{Scheme: "https", Host: address}
-	proxyURL, err := http.ProxyFromEnvironment(&http.Request{URL: endpoint})
+	proxyURL, err := processProxyURL()
 	if err != nil {
 		return nil, err
+	}
+	return dialCourierWithProxy(ctx, address, proxyURL)
+}
+
+func processProxyURL() (string, error) {
+	if raw := strings.TrimSpace(os.Getenv("APPLESERVICES_ACCOUNT_PROXY")); raw != "" {
+		return validateProxyURL(raw)
+	}
+	if strings.TrimSpace(os.Getenv(egresspool.PoolEnv)) != "" {
+		return "", errors.New("aps: proxy pool requires an applied account route")
+	}
+	if raw := strings.TrimSpace(os.Getenv("APPLESERVICES_SOCKS_PROXY")); raw != "" {
+		return validateProxyURL(legacySOCKSURL(raw))
+	}
+	return "", nil
+}
+
+func accountProxyURL(accountDir string) (string, error) {
+	if strings.TrimSpace(os.Getenv(egresspool.PoolEnv)) != "" {
+		route, err := egresspool.Resolve(accountDir)
+		if err != nil {
+			return "", err
+		}
+		if !route.Enabled || strings.TrimSpace(route.URL) == "" {
+			return "", errors.New("aps: configured proxy pool returned no account route")
+		}
+		return validateProxyURL(route.URL)
+	}
+	return processProxyURL()
+}
+
+func legacySOCKSURL(raw string) string {
+	if strings.Contains(raw, "://") {
+		return raw
+	}
+	return "socks5://" + raw
+}
+
+func validateProxyURL(raw string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil || parsed.Host == "" || parsed.Hostname() == "" || parsed.Fragment != "" || parsed.RawQuery != "" {
+		return "", errors.New("aps: proxy URL is invalid")
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	switch parsed.Scheme {
+	case "http", "https", "socks5", "socks5h":
+		return parsed.String(), nil
+	default:
+		return "", errors.New("aps: proxy URL scheme is unsupported")
+	}
+}
+
+func dialCourierWithProxy(ctx context.Context, address, explicitProxy string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: 20 * time.Second}
+	endpoint := &url.URL{Scheme: "https", Host: address}
+	var proxyURL *url.URL
+	if strings.TrimSpace(explicitProxy) != "" {
+		parsed, err := url.Parse(explicitProxy)
+		if err != nil {
+			return nil, errors.New("aps: proxy URL is invalid")
+		}
+		proxyURL = parsed
+	} else {
+		var err error
+		proxyURL, err = http.ProxyFromEnvironment(&http.Request{URL: endpoint})
+		if err != nil {
+			return nil, err
+		}
 	}
 	if proxyURL == nil {
 		return dialer.DialContext(ctx, "tcp", address)
 	}
-	if proxyURL.Scheme == "socks5" || proxyURL.Scheme == "socks5h" {
-		d, err := proxy.FromURL(proxyURL, dialer)
+	scheme := strings.ToLower(proxyURL.Scheme)
+	if scheme == "socks5" || scheme == "socks5h" {
+		socksURL := *proxyURL
+		socksURL.Scheme = "socks5"
+		d, err := proxy.FromURL(&socksURL, dialer)
 		if err != nil {
 			return nil, err
 		}
@@ -42,12 +114,12 @@ func dialCourier(ctx context.Context, address string) (net.Conn, error) {
 		}
 		return cd.DialContext(ctx, "tcp", address)
 	}
-	if proxyURL.Scheme != "http" && proxyURL.Scheme != "https" {
+	if scheme != "http" && scheme != "https" {
 		return nil, errors.New("aps: unsupported proxy scheme")
 	}
 	host := proxyURL.Host
 	if proxyURL.Port() == "" {
-		if proxyURL.Scheme == "https" {
+		if scheme == "https" {
 			host = net.JoinHostPort(proxyURL.Hostname(), "443")
 		} else {
 			host = net.JoinHostPort(proxyURL.Hostname(), "80")
@@ -65,7 +137,7 @@ func dialCourier(ctx context.Context, address string) (net.Conn, error) {
 	}()
 	stop := context.AfterFunc(ctx, func() { connection.Close() })
 	defer stop()
-	if proxyURL.Scheme == "https" {
+	if scheme == "https" {
 		secured := tls.Client(connection, &tls.Config{ServerName: proxyURL.Hostname(), MinVersion: tls.VersionTLS12})
 		if err := secured.HandshakeContext(ctx); err != nil {
 			return nil, err

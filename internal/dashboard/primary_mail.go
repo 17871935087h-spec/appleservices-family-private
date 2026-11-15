@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"time"
+
+	"github.com/Laky-64/appleservices/internal/egresspool"
 )
 
 // Primary-mail state never contains an Apple authentication response.
@@ -164,7 +166,10 @@ func (s *Server) runPrimaryMail(ctx context.Context, account *Account, action st
 	command := exec.CommandContext(ctx, s.config.Python, "-B", "-I", filepath.Join(tools, "primary_mail.py"))
 	configureProcess(command)
 	command.Dir = tools
-	command.Env = filteredActivationEnv("")
+	command.Env, err = egresspool.Environment(filteredActivationEnv(""), account.Dir)
+	if err != nil {
+		return failure
+	}
 	command.Stdin = bytes.NewReader(encoded)
 	command.Stderr = io.Discard
 	var output bytes.Buffer

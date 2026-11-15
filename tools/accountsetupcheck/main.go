@@ -24,6 +24,7 @@ import (
 	"github.com/Laky-64/appleservices/gsa"
 	"github.com/Laky-64/appleservices/icloud"
 	"github.com/Laky-64/appleservices/internal/accountsetup"
+	"github.com/Laky-64/appleservices/internal/egresspool"
 	"github.com/Laky-64/appleservices/nativeadi"
 	"howett.net/plist"
 )
@@ -79,6 +80,9 @@ func run() error {
 	termsAccepted := flag.Bool("terms-accepted", false, "add the reference cookie after this account's verified terms success")
 	icloudCheckpoint := flag.String("icloud-checkpoint", "", "private accepted iCloud session output; separate from live dashboard session")
 	flag.Parse()
+	if err := egresspool.Apply(*dir); err != nil {
+		return err
+	}
 	if *dir == "" || (*dump == "" && !*nativeOnly && *icloudResume == "") {
 		return fmt.Errorf("dir and private dump are required")
 	}

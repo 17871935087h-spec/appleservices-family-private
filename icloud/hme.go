@@ -101,6 +101,7 @@ type HideMyEmailClient struct {
 	authBase    string
 	setupBase   string
 	http        *http.Client
+	transport   *http.Transport
 	jar         http.CookieJar
 	session     hmeSession
 }
@@ -119,6 +120,11 @@ func NewHideMyEmailClient(accountDir, appleID string) (*HideMyEmailClient, error
 		authBase:    "https://idmsa.apple.com/appleauth/auth",
 		setupBase:   "https://setup.icloud.com/setup/ws/1",
 	}
+	transport, err := gsa.AppleRootTransportForAccount(accountDir)
+	if err != nil {
+		return nil, errors.New("hide my email account proxy route is unavailable")
+	}
+	c.transport = transport
 	c.resetHTTP()
 	_ = c.loadSession()
 	return c, nil
@@ -126,10 +132,8 @@ func NewHideMyEmailClient(accountDir, appleID string) (*HideMyEmailClient, error
 
 func (c *HideMyEmailClient) resetHTTP() {
 	jar, _ := cookiejar.New(nil)
-	transport := gsa.AppleRootTransport().(*http.Transport)
-	transport.Proxy = nil
 	c.jar = jar
-	c.http = &http.Client{Jar: jar, Transport: transport, Timeout: 35 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	c.http = &http.Client{Jar: jar, Transport: c.transport.Clone(), Timeout: 35 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
 func randomHex(bytesCount int) string {

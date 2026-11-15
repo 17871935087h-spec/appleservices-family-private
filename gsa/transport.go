@@ -12,6 +12,13 @@ type authenticationTransport struct {
 
 func newAuthenticationTransport() *authenticationTransport {
 	shared := AppleRootTransport().(*http.Transport)
+	return newAuthenticationTransportWithBase(shared)
+}
+
+func newAuthenticationTransportWithBase(shared *http.Transport) *authenticationTransport {
+	if shared == nil {
+		shared = AppleRootTransport().(*http.Transport)
+	}
 	unpooled := shared.Clone()
 	unpooled.DisableKeepAlives = true
 	// An HTTP/2 connection can carry multiple authentication requests. Pin GSA

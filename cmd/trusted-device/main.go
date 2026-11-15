@@ -25,6 +25,7 @@ import (
 	"github.com/Laky-64/appleservices/internal/circle"
 	"github.com/Laky-64/appleservices/internal/control"
 	"github.com/Laky-64/appleservices/internal/credentialvault"
+	"github.com/Laky-64/appleservices/internal/egresspool"
 	"github.com/Laky-64/appleservices/nativeadi"
 )
 
@@ -80,6 +81,9 @@ func run() (runErr error) {
 		// it must not silently make every Mac profile share one push token.
 	}
 	if *probeNative {
+		if strings.TrimSpace(os.Getenv(egresspool.PoolEnv)) != "" || strings.TrimSpace(os.Getenv("APPLESERVICES_ACCOUNT_PROXY")) != "" {
+			return errors.New("native Windows APS diagnostics cannot bind an account proxy route")
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		length, err := aps.ProbeNativePush(ctx)
@@ -101,6 +105,20 @@ func run() (runErr error) {
 	}
 	if strings.TrimSpace(*name) == "" || strings.TrimSpace(*dir) == "" {
 		return errors.New("name and state directory are required")
+	}
+	var assignedRoute egresspool.Route
+	if !*check {
+		var routeErr error
+		assignedRoute, routeErr = egresspool.Resolve(*dir)
+		if routeErr != nil {
+			return routeErr
+		}
+		if err := egresspool.Apply(*dir); err != nil {
+			return err
+		}
+		if *native && os.Getenv("APPLESERVICES_ACCOUNT_PROXY") != "" {
+			return errors.New("account proxy requires the account-private APS transport")
+		}
 	}
 	if !*listenOnly && !*useNativeADI {
 		if err := aps.ValidateCodeProvider(*codeProvider); err != nil {
@@ -142,7 +160,11 @@ func run() (runErr error) {
 				return errors.New("invalid saved push state")
 			}
 		}
-		push, err = aps.NewClient(pushState)
+		if *check {
+			err = aps.ValidateState(pushState)
+		} else {
+			push, err = aps.NewClient(pushState)
+		}
 	}
 	if err != nil {
 		return err
@@ -169,7 +191,7 @@ func run() (runErr error) {
 	}
 	os.Unsetenv("APPLESERVICES_APPLEID")
 	os.Unsetenv("APPLESERVICES_PASSWORD")
-	status := runtimeStatus{PID: os.Getpid(), Running: true, State: "starting"}
+	status := runtimeStatus{PID: os.Getpid(), Running: true, State: "starting", ProxyNodeID: assignedRoute.NodeID, ProxyExitIP: assignedRoute.ExitIP}
 	if err := status.save(*dir); err != nil {
 		return err
 	}

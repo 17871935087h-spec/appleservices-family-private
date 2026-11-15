@@ -1376,7 +1376,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	transport := gsa.AppleRootTransport().(*http.Transport)
+	transport, err := gsa.AppleRootTransportForAccount(*dir)
+	if err != nil {
+		return errors.New("family account proxy route unavailable")
+	}
 	// setup.icloud.com/configurations/init currently stalls on this Windows
 	// route after HTTP/2 negotiation while the same request succeeds over 1.1.
 	transport.ForceAttemptHTTP2 = false
@@ -1411,7 +1414,10 @@ func run() error {
 	if urls == nil {
 		return errors.New("family configuration has no URL bag")
 	}
-	apiTransport := gsa.AppleRootTransport().(*http.Transport)
+	apiTransport, err := gsa.AppleRootTransportForAccount(*dir)
+	if err != nil {
+		return errors.New("family account proxy route unavailable")
+	}
 	defer apiTransport.CloseIdleConnections()
 	apiClient := &http.Client{Jar: jar, Transport: apiTransport, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	keys := make([]string, 0)
@@ -2746,7 +2752,10 @@ func ephemeralFamilyPET(ctx context.Context, native *nativeadi.Client, pushToken
 	for _, cookie := range target.Cookies {
 		cookies[cookie.URL] = append(cookies[cookie.URL], gsa.CookieKV{Name: cookie.Name, Value: cookie.Value})
 	}
-	client := gsa.NewClientFromSession(native, gsa.Session{DSID: target.DSID, Cookies: cookies, Tokens: target.Tokens})
+	client, err := gsa.NewClientFromSessionForAccount(native, gsa.Session{DSID: target.DSID, Cookies: cookies, Tokens: target.Tokens}, targetDir)
+	if err != nil {
+		return "", errors.New("target account proxy route unavailable")
+	}
 	client.EnableNativeDeviceAuthentication()
 	if err := client.SetPushToken(pushToken); err != nil {
 		return "", err

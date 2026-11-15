@@ -5,15 +5,108 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	_ "embed"
+	"errors"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
+	"github.com/Laky-64/appleservices/internal/egresspool"
 	"golang.org/x/net/proxy"
 )
 
+const AccountProxyEnv = "APPLESERVICES_ACCOUNT_PROXY"
+
 func AppleRootTransport() http.RoundTripper {
+	if raw := strings.TrimSpace(os.Getenv(AccountProxyEnv)); raw != "" {
+		transport, err := AppleRootTransportForProxy(raw)
+		if err != nil {
+			return blockedAppleTransport()
+		}
+		return transport
+	}
+	if strings.TrimSpace(os.Getenv(egresspool.PoolEnv)) != "" {
+		// A worker that inherited a configured pool must have had its account
+		// route installed before it creates a client. Never let a missing route
+		// silently fall back to the machine's ordinary egress.
+		return blockedAppleTransport()
+	}
+	if raw := strings.TrimSpace(os.Getenv("APPLESERVICES_SOCKS_PROXY")); raw != "" {
+		transport, err := AppleRootTransportForProxy(legacySOCKSURL(raw))
+		if err != nil {
+			return blockedAppleTransport()
+		}
+		return transport
+	}
+	transport := newAppleRootTransport()
+	transport.Proxy = http.ProxyFromEnvironment
+	return transport
+}
+
+// AppleRootTransportForAccount resolves a stable route for one account. When a
+// pool is configured, its assignment takes precedence over inherited process
+// proxy variables and resolution failures are returned to the caller.
+func AppleRootTransportForAccount(accountDir string) (*http.Transport, error) {
+	if strings.TrimSpace(os.Getenv(egresspool.PoolEnv)) != "" {
+		route, err := egresspool.Resolve(accountDir)
+		if err != nil {
+			return nil, err
+		}
+		if !route.Enabled || strings.TrimSpace(route.URL) == "" {
+			return nil, errors.New("gsa: configured proxy pool returned no account route")
+		}
+		return AppleRootTransportForProxy(route.URL)
+	}
+	if raw := strings.TrimSpace(os.Getenv(AccountProxyEnv)); raw != "" {
+		return AppleRootTransportForProxy(raw)
+	}
+	if raw := strings.TrimSpace(os.Getenv("APPLESERVICES_SOCKS_PROXY")); raw != "" {
+		return AppleRootTransportForProxy(legacySOCKSURL(raw))
+	}
+	transport := newAppleRootTransport()
+	transport.Proxy = http.ProxyFromEnvironment
+	return transport, nil
+}
+
+// AppleRootTransportForProxy builds an Apple-root-verifying transport through
+// one explicit HTTP, HTTPS, or SOCKS5 proxy URL.
+func AppleRootTransportForProxy(raw string) (*http.Transport, error) {
+	parsed, err := parseProxyURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	transport := newAppleRootTransport()
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		transport.Proxy = http.ProxyURL(parsed)
+	case "socks5", "socks5h":
+		var auth *proxy.Auth
+		if parsed.User != nil {
+			password, _ := parsed.User.Password()
+			auth = &proxy.Auth{User: parsed.User.Username(), Password: password}
+		}
+		dialer, dialErr := proxy.SOCKS5("tcp", parsed.Host, auth, proxy.Direct)
+		if dialErr != nil {
+			return nil, errors.New("gsa: account SOCKS proxy is invalid")
+		}
+		transport.Proxy = nil
+		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			if contextual, ok := dialer.(interface {
+				DialContext(context.Context, string, string) (net.Conn, error)
+			}); ok {
+				return contextual.DialContext(ctx, network, address)
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return dialer.Dial(network, address)
+		}
+	}
+	return transport, nil
+}
+
+func newAppleRootTransport() *http.Transport {
 	pool, err := x509.SystemCertPool()
 	if err != nil || pool == nil {
 		pool = x509.NewCertPool()
@@ -28,7 +121,38 @@ func AppleRootTransport() http.RoundTripper {
 		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
 	}
 	transport.TLSClientConfig.RootCAs = pool
-	applySOCKS5Proxy(transport)
+	return transport
+}
+
+func parseProxyURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil || parsed.Host == "" || parsed.Fragment != "" || parsed.RawQuery != "" {
+		return nil, errors.New("gsa: account proxy URL is invalid")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return nil, errors.New("gsa: account proxy scheme is unsupported")
+	}
+	if parsed.Hostname() == "" {
+		return nil, errors.New("gsa: account proxy URL is invalid")
+	}
+	return parsed, nil
+}
+
+func legacySOCKSURL(raw string) string {
+	if strings.Contains(raw, "://") {
+		return raw
+	}
+	return "socks5://" + raw
+}
+
+func blockedAppleTransport() *http.Transport {
+	transport := newAppleRootTransport()
+	transport.Proxy = nil
+	transport.DialContext = func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("gsa: account proxy route is unavailable")
+	}
 	return transport
 }
 

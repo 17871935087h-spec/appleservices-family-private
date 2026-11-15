@@ -208,8 +208,10 @@ func validateNativeStorageConfirmation(q, original url.Values, session *storeSes
 // post carries plain browser headers, and volumeAuthenticate is expected to
 // create the commerce session.
 func SubmitStoragePurchaseAnonymous(ctx context.Context, info *StoragePlanInfo, appleID, password, dsid, adsid, token, storageBuyToken string, headers map[string]string, target PurchaseTarget) (*PurchaseResult, error) {
+	client := appleHTTPClient(ctx, 30*time.Second)
+	client.Jar = mustCookieJar()
 	anonymous := &StoreCommerceSession{
-		client:   &http.Client{Jar: mustCookieJar(), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		client:   client,
 		identity: &storeSession{DSID: dsid, Anonymous: true},
 	}
 	defer anonymous.client.CloseIdleConnections()

@@ -24,6 +24,7 @@ import (
 
 	"github.com/Laky-64/appleservices/icloud"
 	"github.com/Laky-64/appleservices/internal/control"
+	"github.com/Laky-64/appleservices/internal/egresspool"
 	"github.com/Laky-64/appleservices/internal/privatebody"
 )
 
@@ -83,6 +84,8 @@ type Status struct {
 	PushReconnectCount   int       `json:"push_reconnect_count"`
 	PushIssue            string    `json:"push_issue,omitempty"`
 	FailureStage         string    `json:"failure_stage,omitempty"`
+	ProxyNodeID          string    `json:"proxy_node_id,omitempty"`
+	ProxyExitIP          string    `json:"proxy_exit_ip,omitempty"`
 }
 type view struct {
 	Status                    Status                  `json:"status"`
@@ -550,7 +553,11 @@ func parseFamilyPoolProjection(output string) (*control.FamilyPoolProjection, er
 
 func runFamilyPoolProjection(ctx context.Context, helper, accountDir, registry string) (*control.FamilyPoolProjection, error) {
 	command := exec.CommandContext(ctx, helper, "-dir", accountDir, "-registry", registry, "-pool-projection")
-	command.Env = os.Environ()
+	var envErr error
+	command.Env, envErr = egresspool.Environment(os.Environ(), accountDir)
+	if envErr != nil {
+		return nil, envErr
+	}
 	var output bytes.Buffer
 	command.Stdout = &output
 	command.Stderr = &output
@@ -603,7 +610,11 @@ func runFamilyStatus(ctx context.Context, helper string, account *Account, joinS
 		args = append(args, "-join-shared-storage")
 	}
 	command := exec.CommandContext(ctx, helper, args...)
-	command.Env = os.Environ()
+	var envErr error
+	command.Env, envErr = egresspool.Environment(os.Environ(), account.Dir)
+	if envErr != nil {
+		return nil, envErr
+	}
 	var output bytes.Buffer
 	command.Stdout = &output
 	command.Stderr = &output
@@ -821,7 +832,11 @@ func (s *Server) removeFamilyMember(ctx context.Context, organizer *Account, tar
 		}
 		remover = func(actionCtx context.Context, organizer, target *Account) (*control.FamilyInfo, *control.FamilyInfo, error) {
 			command := exec.CommandContext(actionCtx, helper, "-dir", organizer.Dir, "-remove-pool-member-dir", target.Dir, "-safe-json")
-			command.Env = os.Environ()
+			var envErr error
+			command.Env, envErr = egresspool.Environment(os.Environ(), organizer.Dir)
+			if envErr != nil {
+				return nil, nil, envErr
+			}
 			var output bytes.Buffer
 			command.Stdout = &output
 			command.Stderr = &output
@@ -1017,8 +1032,15 @@ func (s *Server) startInMode(ctx context.Context, dir string, creds credentials,
 	}
 	defer s.launchMu.Unlock()
 	s.setMessage(account, "")
+	assignedRoute, routeErr := egresspool.Resolve(dir)
+	if routeErr != nil {
+		return control.Result{Message: "账号代理不可用：" + routeErr.Error(), Stage: "proxy-unavailable"}
+	}
 	current := s.readStatusFrom(dir)
 	if current.Running {
+		if assignedRoute.Enabled && (current.ProxyNodeID != assignedRoute.NodeID || current.ProxyExitIP != assignedRoute.ExitIP) && creds.Password == "" {
+			return control.Result{Message: "该账号后台尚未应用所选代理，请先停止，再恢复已保存会话", Stage: "proxy-restart-required"}
+		}
 		// A password supplied for an already-running account is an explicit
 		// reconnect request. Do not silently report the old passwordless worker
 		// as connected; stop it and start a fresh authenticated session below.
@@ -1037,6 +1059,12 @@ func (s *Server) startInMode(ctx context.Context, dir string, creds credentials,
 	creds.TwoFactor = normalizeDashboardTwoFactorMethod(creds.TwoFactor)
 	if creds.TwoFactor != "sms" && creds.TwoFactor != "sms-existing" && creds.TwoFactor != "circle" && creds.TwoFactor != "trusted-device" {
 		return control.Result{Message: "不支持的验证方式"}
+	}
+	// Allocate before stopping a running worker or provisioning a new identity.
+	// An exhausted/invalid pool must never fall back to the shared direct exit.
+	workerEnv, envErr := egresspool.Environment(os.Environ(), dir)
+	if envErr != nil {
+		return control.Result{Message: "账号代理不可用：" + envErr.Error(), Stage: "proxy-unavailable"}
 	}
 	s.setLaunching(account, true)
 	defer s.setLaunching(account, false)
@@ -1073,7 +1101,7 @@ func (s *Server) startInMode(ctx context.Context, dir string, creds credentials,
 		command.Args = append(command.Args, "-resume-session")
 	}
 	configureProcess(command)
-	for _, entry := range os.Environ() {
+	for _, entry := range workerEnv {
 		key, _, _ := strings.Cut(entry, "=")
 		if !strings.EqualFold(key, "APPLESERVICES_APPLEID") && !strings.EqualFold(key, "APPLESERVICES_PASSWORD") {
 			command.Env = append(command.Env, entry)

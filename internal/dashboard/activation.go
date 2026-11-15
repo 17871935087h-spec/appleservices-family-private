@@ -14,6 +14,7 @@ import (
 
 	appleservices "github.com/Laky-64/appleservices"
 	"github.com/Laky-64/appleservices/internal/control"
+	"github.com/Laky-64/appleservices/internal/egresspool"
 )
 
 func verifiedGSACheckpointReady(dir, appleID string) bool {
@@ -80,11 +81,15 @@ func filteredActivationEnv(appleID string) []string {
 	return append(result, "APPLESERVICES_APPLEID="+appleID, "APPLESERVICES_DELEGATE_PATH=v2", "NO_PROXY=*")
 }
 
-func runActivationCommand(ctx context.Context, root, appleID, executable string, args ...string) ([]byte, error) {
+func runActivationCommand(ctx context.Context, root, accountDir, appleID, executable string, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, executable, args...)
 	configureProcess(command)
 	command.Dir = root
-	command.Env = filteredActivationEnv(appleID)
+	var envErr error
+	command.Env, envErr = egresspool.Environment(filteredActivationEnv(appleID), accountDir)
+	if envErr != nil {
+		return nil, envErr
+	}
 	output, err := command.CombinedOutput()
 	if len(output) > 256<<10 {
 		return nil, errors.New("激活组件返回内容过大")
@@ -131,7 +136,7 @@ func (s *Server) activationPlan(ctx context.Context, account *Account, runDir st
 	root := s.activationRoot()
 	helper := filepath.Join(filepath.Dir(s.config.Worker), "accountsetupcheck.exe")
 	dump := filepath.Join(runDir, "setup.html")
-	output, err := runActivationCommand(ctx, root, account.AppleID, helper,
+	output, err := runActivationCommand(ctx, root, account.Dir, account.AppleID, helper,
 		"-dir", account.Dir, "-resume", filepath.Join(account.Dir, "session.json"), "-dump", dump)
 	if err != nil {
 		return nil, errors.New("无法读取 Apple 当前条款状态")
@@ -198,7 +203,7 @@ func (s *Server) activationAction(parent context.Context, account *Account, acce
 	}
 	helper := filepath.Join(filepath.Dir(s.config.Worker), "accountsetupcheck.exe")
 	termsDump := filepath.Join(runDir, "terms.html")
-	_, _ = runActivationCommand(ctx, root, account.AppleID, helper,
+	_, _ = runActivationCommand(ctx, root, account.Dir, account.AppleID, helper,
 		"-dir", account.Dir, "-resume", filepath.Join(account.Dir, "session.json"), "-accept-terms", "-expected-terms", approvedTuple, "-dump", termsDump)
 	if !readTermsReceipt(termsDump + ".update.json") {
 		return control.Result{Message: "Apple 未确认条款接受状态", Stage: "activation-terms", Activation: plan}
@@ -209,7 +214,7 @@ func (s *Server) activationAction(parent context.Context, account *Account, acce
 		return control.Result{Message: "无法准备 Mac NAC 运行时", Stage: "activation-nac"}
 	}
 	validation := filepath.Join(runDir, "nac-validation.bin")
-	nacOutput, nacErr := runActivationCommand(ctx, root, account.AppleID, s.config.Python,
+	nacOutput, nacErr := runActivationCommand(ctx, root, account.Dir, account.AppleID, s.config.Python,
 		filepath.Join(root, "tools", "mac-nac-check.py"), "--profile", filepath.Join(account.Dir, "native-adi", "hw_info.plist"),
 		"--runtime", runtimeCopy, "--encrypt-dll", filepath.Join(root, ".cache", "activation-source-review", "mac-io-encrypt.dll"),
 		"--validation-out", validation, "--synthetic-missing-board-fields", "--transport", filepath.Join(filepath.Dir(s.config.Worker), "nacexchange.exe"))
@@ -217,7 +222,7 @@ func (s *Server) activationAction(parent context.Context, account *Account, acce
 		return control.Result{Message: "Mac NAC 生成未完成", Stage: "activation-nac"}
 	}
 	checkpoint := filepath.Join(runDir, "icloud-accepted.json")
-	delegateOutput, delegateErr := runActivationCommand(ctx, root, account.AppleID, helper,
+	delegateOutput, delegateErr := runActivationCommand(ctx, root, account.Dir, account.AppleID, helper,
 		"-dir", account.Dir, "-resume", filepath.Join(account.Dir, "session.json"), "-delegate-only", "-terms-accepted",
 		"-nac-validation", validation, "-dump", filepath.Join(runDir, "delegate.plist"), "-icloud-checkpoint", checkpoint)
 	if delegateErr != nil || !strings.Contains(string(delegateOutput), "delegate accepted; mme-token-present=true") || !strings.Contains(string(delegateOutput), "quota accepted;") {

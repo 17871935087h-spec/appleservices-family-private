@@ -76,10 +76,26 @@ func (c *Client) AnisetteHeaders() (map[string]string, error) {
 const gsaBaseURL = "https://gsa.apple.com"
 
 func NewClient(anisette AnisetteProvider) *Client {
+	return NewClientWithTransport(anisette, AppleRootTransport().(*nethttp.Transport))
+}
+
+// NewClientForAccount creates an authentication client whose Apple requests
+// use the route assigned to accountDir. It never changes process environment.
+func NewClientForAccount(anisette AnisetteProvider, accountDir string) (*Client, error) {
+	transport, err := AppleRootTransportForAccount(accountDir)
+	if err != nil {
+		return nil, err
+	}
+	return NewClientWithTransport(anisette, transport), nil
+}
+
+// NewClientWithTransport allows a shared process to keep account transports
+// isolated without changing global proxy variables.
+func NewClientWithTransport(anisette AnisetteProvider, transport *nethttp.Transport) *Client {
 	jar, _ := cookiejar.New(nil)
 	return &Client{
 		anisette:  anisette,
-		transport: newAuthenticationTransport(),
+		transport: newAuthenticationTransportWithBase(transport),
 		cookieJar: jar,
 	}
 }

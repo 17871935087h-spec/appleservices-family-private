@@ -35,6 +35,9 @@ func skillAuthenticationAgent() string {
 type skillPythonTransport struct{}
 
 func (skillPythonTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if hasConfiguredAccountEgress(req.Context()) {
+		return nil, errors.New("Python Store transport cannot use the configured account proxy")
+	}
 	var body []byte
 	if req.Body != nil {
 		var err error
@@ -80,11 +83,22 @@ func (skillPythonTransport) RoundTrip(req *http.Request) (*http.Response, error)
 }
 
 func skillHTTPTransport() http.RoundTripper {
+	return skillHTTPTransportForContext(context.Background())
+}
+
+func skillHTTPTransportForContext(ctx context.Context) http.RoundTripper {
 	if os.Getenv("APPLESERVICES_SKILL_HTTP_PYTHON") == "1" {
 		return skillPythonTransport{}
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
+	base, err := storeProxyTransport(ctx)
+	if err != nil {
+		return egressErrorTransport{err: err}
+	}
+	transport, ok := base.(*http.Transport)
+	if !ok || transport == nil {
+		return egressErrorTransport{err: errors.New("Store proxy transport is unavailable")}
+	}
+	transport = transport.Clone()
 	if os.Getenv("APPLESERVICES_SKILL_REFERENCE_WIRE") == "1" {
 		transport.TLSClientConfig = &tls.Config{
 			MinVersion:       tls.VersionTLS12,
@@ -95,8 +109,19 @@ func skillHTTPTransport() http.RoundTripper {
 }
 
 func skillMatchedHTTPTransport() http.RoundTripper {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
+	return skillMatchedHTTPTransportForContext(context.Background())
+}
+
+func skillMatchedHTTPTransportForContext(ctx context.Context) http.RoundTripper {
+	base, err := storeProxyTransport(ctx)
+	if err != nil {
+		return egressErrorTransport{err: err}
+	}
+	transport, ok := base.(*http.Transport)
+	if !ok || transport == nil {
+		return egressErrorTransport{err: errors.New("Store proxy transport is unavailable")}
+	}
+	transport = transport.Clone()
 	// Keep the established Store TLS fingerprint together with the matched
 	// endpoint and exact signed XML wire instead of splitting them across
 	// process-global diagnostic switches.
@@ -127,25 +152,49 @@ func AuthenticateSkillStore(ctx context.Context, appleID, password string, codeP
 	if err != nil || isVirtualInterface("", hardware) {
 		return nil, &StorageError{Stage: "purchase-store-physical-hardware"}
 	}
-	client := &http.Client{Jar: mustCookieJar(), Transport: skillHTTPTransport(), Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Jar: mustCookieJar(), Transport: skillHTTPTransportForContext(ctx), Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	return authenticateSkillStoreClient(ctx, client, guid, appleID, password, codeProvider)
 }
 
 // AuthenticateSignedSkillStore keeps the physical Store identity while testing
 // the signed native endpoint returned by Apple's current App Store bag.
 func AuthenticateSignedSkillStore(ctx context.Context, appleID, password string, headers map[string]string, appStoreProfile bool, codeProvider func() (string, error)) (*StoreCommerceSession, error) {
-	return authenticateSignedSkillStoreMode(ctx, appleID, password, headers, appStoreProfile, os.Getenv("APPLESERVICES_SKILL_MATCHED_BAG") == "1", skillHTTPTransport(), codeProvider)
+	return authenticateSignedSkillStoreMode(ctx, appleID, password, headers, appStoreProfile, os.Getenv("APPLESERVICES_SKILL_MATCHED_BAG") == "1", skillHTTPTransportForContext(ctx), codeProvider)
 }
 
 // AuthenticateMatchedSkillStore preserves the authenticate/setup/certificate
 // tuple returned by one Apple Store bag without process-global diagnostics.
 func AuthenticateMatchedSkillStore(ctx context.Context, appleID, password string, headers map[string]string, codeProvider func() (string, error)) (*StoreCommerceSession, error) {
-	session, err := authenticateSignedSkillStoreMode(ctx, appleID, password, headers, false, true, skillMatchedHTTPTransport(), codeProvider)
-	if err == nil || !storeRoutingFailure(err) || os.Getenv("APPLESERVICES_SKILL_HTTP_PYTHON") == "1" {
+	session, err := authenticateSignedSkillStoreMode(ctx, appleID, password, headers, false, true, skillMatchedHTTPTransportForContext(ctx), codeProvider)
+	if err == nil || !storeRoutingFailure(err) || os.Getenv("APPLESERVICES_SKILL_HTTP_PYTHON") == "1" || hasConfiguredAccountEgress(ctx) {
 		return session, err
 	}
 	fmt.Println("Apple Store Go transport reached only routing responses; retrying once with direct Python TLS transport")
 	return authenticateSignedSkillStoreMode(ctx, appleID, password, headers, false, true, skillPythonTransport{}, codeProvider)
+}
+
+type egressErrorTransport struct{ err error }
+
+func (t egressErrorTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	if t.err == nil {
+		return nil, errors.New("account proxy route is unavailable")
+	}
+	return nil, t.err
+}
+
+func hasConfiguredAccountEgress(ctx context.Context) bool {
+	if _, accountBound := accountRouteTransport(ctx); accountBound {
+		return true
+	}
+	for _, name := range []string{
+		"APPLESERVICES_PROXY_POOL", "APPLESERVICES_ACCOUNT_PROXY", "APPLESERVICES_STORE_PROXY",
+		"APPLESERVICES_SOCKS_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+	} {
+		if strings.TrimSpace(os.Getenv(name)) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func storeRoutingFailure(err error) bool {
@@ -367,6 +416,12 @@ func (s *StoreCommerceSession) SavePrivateSkillSession(path, appleID string) err
 }
 
 func LoadPrivateSkillSession(path, appleID, expectedDSID string) (*StoreCommerceSession, error) {
+	return LoadPrivateSkillSessionWithContext(context.Background(), path, appleID, expectedDSID)
+}
+
+// LoadPrivateSkillSessionWithContext restores a private Store session with an
+// account-scoped proxy route supplied by WithAccountRoute.
+func LoadPrivateSkillSessionWithContext(ctx context.Context, path, appleID, expectedDSID string) (*StoreCommerceSession, error) {
 	data, err := os.ReadFile(path)
 	var saved struct {
 		AppleID  string                    `json:"apple-id"`
@@ -388,7 +443,7 @@ func LoadPrivateSkillSession(path, appleID, expectedDSID string) (*StoreCommerce
 		}
 		jar.SetCookies(u, cookies)
 	}
-	return &StoreCommerceSession{identity: &saved.Identity, client: &http.Client{Jar: jar, Transport: skillHTTPTransport(), Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	return &StoreCommerceSession{identity: &saved.Identity, client: &http.Client{Jar: jar, Transport: skillHTTPTransportForContext(ctx), Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 
 func (s *StoreCommerceSession) skillRequest(ctx context.Context, method, endpoint, agent, contentType string, body []byte) ([]byte, int, error) {

@@ -193,7 +193,7 @@ func appPasswordMessage(stage string) string {
 }
 
 func newAppPasswordService(s *Server) *appPasswordService {
-	service := &appPasswordService{newClient: func(id string) (appPasswordClient, error) { return icloud.NewAppleAccountClient(id) }, loadBlob: credentialvault.LoadBlob, saveBlob: credentialvault.SaveBlob, loadPassword: credentialvault.Load}
+	service := &appPasswordService{loadBlob: credentialvault.LoadBlob, saveBlob: credentialvault.SaveBlob, loadPassword: credentialvault.Load}
 	service.deviceCode = func(ctx context.Context, account *Account) (string, error) {
 		var result control.Result
 		if err := s.callFor(ctx, account.Dir, "/action", control.Action{Action: "code"}, &result); err != nil || !result.OK || len(result.Code) != 6 {
@@ -207,6 +207,15 @@ func newAppPasswordService(s *Server) *appPasswordService {
 		return result.Code, nil
 	}
 	return service
+}
+
+func (p *appPasswordService) clientForAccount(account *Account) (appPasswordClient, error) {
+	if p.newClient != nil {
+		return p.newClient(account.AppleID)
+	}
+	// The dashboard handles several accounts concurrently. Select the route
+	// from the account directory without changing process-wide proxy variables.
+	return icloud.NewAppleAccountClientForAccount(account.Dir, account.AppleID)
 }
 
 func (s *Server) handleAppPasswordsAPI(w http.ResponseWriter, r *http.Request) bool {
@@ -435,7 +444,7 @@ func (p *appPasswordService) run(ctx context.Context, account *Account, action s
 			return state
 		}
 	}
-	client, err := p.newClient(account.AppleID)
+	client, err := p.clientForAccount(account)
 	if err != nil {
 		setAppPasswordLocalFailure(&state, "client_init", err)
 		return state
@@ -466,7 +475,7 @@ func (p *appPasswordService) run(ctx context.Context, account *Account, action s
 			state.Stage = "session_required"
 			// Restore may have partially initialized a client before rejecting a
 			// malformed cache. Recreate it before the one authorized login attempt.
-			client, err = p.newClient(account.AppleID)
+			client, err = p.clientForAccount(account)
 			if err != nil {
 				state.Stage = "unavailable"
 				setAppPasswordLocalFailure(&state, "client_init", err)
@@ -495,7 +504,7 @@ func (p *appPasswordService) run(ctx context.Context, account *Account, action s
 			// authorized authentication with a new cookie jar and no stale portal
 			// SCNT/API key, while retaining the saved result and old cache until
 			// authentication succeeds. Risk responses never enter this branch.
-			client, err = p.newClient(account.AppleID)
+			client, err = p.clientForAccount(account)
 			if err != nil {
 				state.Stage = "unavailable"
 				setAppPasswordLocalFailure(&state, "client_init", err)

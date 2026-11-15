@@ -16,6 +16,7 @@ import (
 
 	"github.com/Laky-64/appleservices"
 	"github.com/Laky-64/appleservices/aps"
+	"github.com/Laky-64/appleservices/internal/egresspool"
 	"github.com/google/uuid"
 	"howett.net/plist"
 )
@@ -25,6 +26,9 @@ func run() error {
 	profile := flag.String("profile", "", "explicit bound native hardware profile")
 	state := flag.String("state", "", "private account APS state")
 	flag.Parse()
+	if err := egresspool.Apply(*dir); err != nil {
+		return err
+	}
 	var device appleservices.Device
 	data, err := os.ReadFile(filepath.Join(*dir, "device.json"))
 	if err != nil || json.Unmarshal(data, &device) != nil || len(device.Identifier) != 16 {

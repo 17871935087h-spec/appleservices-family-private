@@ -113,10 +113,8 @@ var diagnosticTextKeys = map[string]bool{
 // with the native Store credentials (X-Token plus session cookies) so the two
 // authentication styles can be compared.
 func ProbeStorageEndpoints(ctx context.Context, dsid, adsid, token string, headers map[string]string, commerce *StoreCommerceSession) []StorageEndpointProbe {
-	client := &http.Client{
-		Timeout:       30 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
+	client := appleHTTPClient(ctx, 30*time.Second)
+	defer client.CloseIdleConnections()
 	applyICloud := func(req *http.Request) {
 		for key, value := range headers {
 			req.Header.Set(key, value)
@@ -202,10 +200,8 @@ type ProbeSpec struct {
 // ProbeCustomEndpoints runs caller-supplied probes with the same auth styles
 // as ProbeStorageEndpoints.
 func ProbeCustomEndpoints(ctx context.Context, specs []ProbeSpec, dsid, adsid, token string, headers map[string]string, commerce *StoreCommerceSession) []StorageEndpointProbe {
-	client := &http.Client{
-		Timeout:       30 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
+	client := appleHTTPClient(ctx, 30*time.Second)
+	defer client.CloseIdleConnections()
 	applyICloud := func(req *http.Request) {
 		for key, value := range headers {
 			req.Header.Set(key, value)

@@ -18,8 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Laky-64/appleservices/gsa"
 	"github.com/Laky-64/appleservices/internal/sap"
-	"golang.org/x/net/proxy"
 	"howett.net/plist"
 )
 
@@ -385,41 +385,51 @@ func (s *StoreCommerceSession) MatchesAccount(dsid string) bool {
 	return s != nil && s.client != nil && s.identity != nil && dsid != "" && s.identity.DSID == dsid && s.identity.PasswordToken != ""
 }
 
-// storeProxyTransport returns a transport that routes store traffic through
-// APPLESERVICES_STORE_PROXY (host:port, SOCKS5) when configured. The store
-// auth endpoint rate-limits by egress address, so a different exit keeps the
-// purchase chain usable while the account's own services stay direct.
-func storeProxyTransport() http.RoundTripper {
-	raw := strings.TrimSpace(os.Getenv("APPLESERVICES_STORE_PROXY"))
-	if raw == "" {
-		return nil
+// storeProxyTransport uses an account-bound route when one is present in the
+// request context. The legacy STORE_PROXY override remains available only when
+// no account pool is configured; invalid configured routes never fall back.
+func storeProxyTransport(ctx context.Context) (http.RoundTripper, error) {
+	if transport, accountBound := accountRouteTransport(ctx); accountBound {
+		return transport.Clone(), nil
 	}
-	dialer, err := proxy.SOCKS5("tcp", raw, nil, proxy.Direct)
-	if err != nil {
-		return nil
+	if strings.TrimSpace(os.Getenv("APPLESERVICES_PROXY_POOL")) != "" {
+		return gsa.AppleRootTransport(), nil
 	}
-	type contextDialer interface {
-		DialContext(context.Context, string, string) (net.Conn, error)
+	if raw := strings.TrimSpace(os.Getenv("APPLESERVICES_STORE_PROXY")); raw != "" {
+		if !strings.Contains(raw, "://") {
+			raw = "socks5://" + raw
+		}
+		transport, err := gsa.AppleRootTransportForProxy(raw)
+		if err != nil {
+			return nil, errors.New("icloud: configured Store proxy is invalid")
+		}
+		return transport, nil
 	}
-	return &http.Transport{
-		Proxy: nil,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if cd, ok := dialer.(contextDialer); ok {
-				return cd.DialContext(ctx, network, addr)
-			}
-			return dialer.Dial(network, addr)
-		},
-	}
+	return gsa.AppleRootTransport(), nil
 }
 
 func AuthenticateStore(ctx context.Context, appleID, password, code string, headers map[string]string) (*StoreCommerceSession, error) {
-	client := &http.Client{Jar: mustCookieJar(), Transport: storeProxyTransport(), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	transport, err := storeProxyTransport(ctx)
+	if err != nil {
+		return nil, &StorageError{Stage: "purchase-store-proxy"}
+	}
+	client := &http.Client{Jar: mustCookieJar(), Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	identity, err := authenticateStoreWithSAP(ctx, client, appleID, password, code, headers)
 	if err != nil {
 		client.CloseIdleConnections()
 		return nil, err
 	}
 	return &StoreCommerceSession{client: client, identity: identity}, nil
+}
+
+// AuthenticateStoreForAccount resolves and pins Store traffic to accountDir.
+// This form is required when multiple accounts share one process.
+func AuthenticateStoreForAccount(ctx context.Context, accountDir, appleID, password, code string, headers map[string]string) (*StoreCommerceSession, error) {
+	routed, err := WithAccountRoute(ctx, accountDir)
+	if err != nil {
+		return nil, &StorageError{Stage: "purchase-store-proxy"}
+	}
+	return AuthenticateStore(routed, appleID, password, code, headers)
 }
 
 // AuthenticateStoreForHardware preserves an explicitly selected account Mac's
@@ -456,9 +466,12 @@ func authenticateStoreForHardwareMode(ctx context.Context, appleID, password, co
 		return nil, &StorageError{Stage: "purchase-store-hardware"}
 	}
 	guid := strings.ToUpper(fmt.Sprintf("%x", hardware))
-	client := &http.Client{Jar: mustCookieJar(), Transport: storeProxyTransport(), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	transport, err := storeProxyTransport(ctx)
+	if err != nil {
+		return nil, &StorageError{Stage: "purchase-store-proxy"}
+	}
+	client := &http.Client{Jar: mustCookieJar(), Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	var bag storeSAPBag
-	var err error
 	if appStoreProfile {
 		bag, err = loadStoreSAPBagForAgent(ctx, client, guid, storeMacUserAgent, true)
 	} else {

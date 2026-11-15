@@ -54,25 +54,39 @@ type portalBootstrap struct {
 }
 
 func NewAppleAccountClient(appleID string) (*AppleAccountClient, error) {
-	return newAppleAccountClient("", appleID)
+	return newAppleAccountClient("", appleID, false)
 }
 
 // NewAppleAccountClientWithStore restores an account-bound management session
 // from the local account directory. It never stores or loads a password.
 func NewAppleAccountClientWithStore(accountDir, appleID string) (*AppleAccountClient, error) {
-	return newAppleAccountClient(accountDir, appleID)
+	return newAppleAccountClient(accountDir, appleID, true)
 }
 
-func newAppleAccountClient(accountDir, appleID string) (*AppleAccountClient, error) {
+// NewAppleAccountClientForAccount binds network routing to accountDir without
+// reading or persisting an account-management session in that directory.
+func NewAppleAccountClientForAccount(accountDir, appleID string) (*AppleAccountClient, error) {
+	return newAppleAccountClient(accountDir, appleID, false)
+}
+
+func newAppleAccountClient(accountDir, appleID string, restoreSession bool) (*AppleAccountClient, error) {
 	appleID = strings.TrimSpace(appleID)
 	if appleID == "" {
 		return nil, errors.New("Apple Account binding is incomplete")
 	}
 	jar, _ := cookiejar.New(nil)
-	transport := gsa.AppleRootTransport().(*http.Transport)
-	transport.Proxy = nil
+	var transport *http.Transport
+	if strings.TrimSpace(accountDir) == "" {
+		transport = gsa.AppleRootTransport().(*http.Transport)
+	} else {
+		var err error
+		transport, err = gsa.AppleRootTransportForAccount(accountDir)
+		if err != nil {
+			return nil, errors.New("Apple Account proxy route is unavailable")
+		}
+	}
 	sessionPath := ""
-	if strings.TrimSpace(accountDir) != "" {
+	if restoreSession && strings.TrimSpace(accountDir) != "" {
 		sessionPath = filepath.Join(accountDir, "account-management-session.json")
 	}
 	c := &AppleAccountClient{appleID: appleID, sessionPath: sessionPath, jar: jar, http: &http.Client{Jar: jar, Transport: transport, Timeout: 35 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}

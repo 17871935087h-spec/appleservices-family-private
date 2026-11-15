@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Laky-64/appleservices/internal/egresspool"
 	"github.com/Laky-64/appleservices/nativeadi"
 )
 
@@ -53,6 +54,15 @@ func macPushStateReady(dir string) bool {
 }
 
 func (s *Server) runMacPushProvisioner(ctx context.Context, dir string) error {
+	route, err := egresspool.Resolve(dir)
+	if err != nil {
+		return err
+	}
+	if route.Enabled {
+		// The pinned native bootstrap owns its own sockets and has no verified
+		// proxy option. Do not let it bypass an account's configured exit.
+		return errors.New("proxy pool requires an existing account-private APS identity; native bootstrap cannot use the selected proxy")
+	}
 	if s.config.Python == "" || s.config.MacPushSetup == "" || s.config.Library == "" {
 		return errors.New("Mac APS provisioner is not configured")
 	}

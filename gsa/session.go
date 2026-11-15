@@ -70,7 +70,23 @@ func (c *Client) Snapshot(dsid string, tokens map[string]string) (Session, error
 }
 
 func NewClientFromSession(anisette AnisetteProvider, sess Session) *Client {
-	c := NewClient(anisette)
+	return NewClientFromSessionWithTransport(anisette, sess, AppleRootTransport().(*http.Transport))
+}
+
+// NewClientFromSessionForAccount restores a session on the account's assigned
+// route without changing process environment.
+func NewClientFromSessionForAccount(anisette AnisetteProvider, sess Session, accountDir string) (*Client, error) {
+	transport, err := AppleRootTransportForAccount(accountDir)
+	if err != nil {
+		return nil, err
+	}
+	return NewClientFromSessionWithTransport(anisette, sess, transport), nil
+}
+
+// NewClientFromSessionWithTransport restores a session with an explicit
+// account-scoped transport in shared processes.
+func NewClientFromSessionWithTransport(anisette AnisetteProvider, sess Session, transport *http.Transport) *Client {
+	c := NewClientWithTransport(anisette, transport)
 	if sess.AnisetteHeaders != nil {
 		c.cachedAnisetteHeaders = httpx.NormalizeAnisetteHeaders(sess.AnisetteHeaders)
 	}

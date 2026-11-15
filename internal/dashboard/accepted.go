@@ -71,6 +71,10 @@ func (s *Server) acceptedStorageAction(parent context.Context, account *Account,
 	}
 	ctx, cancel := context.WithTimeout(parent, 45*time.Second)
 	defer cancel()
+	ctx, err = icloud.WithAccountRoute(ctx, account.Dir)
+	if err != nil {
+		return control.Result{Message: "账号代理不可用", Stage: "proxy-unavailable"}
+	}
 	client, err := nativeadi.NewClient(nativeadi.Config{LibraryPath: s.config.Library, ProfileDir: profile, Python: s.config.Python, Identifier: device.Identifier, Serial: device.SerialNumber, PushToken: hardware.Push.Token})
 	if err != nil {
 		return control.Result{Message: "无法加载账号 Mac 身份", Stage: "accepted-checkpoint"}

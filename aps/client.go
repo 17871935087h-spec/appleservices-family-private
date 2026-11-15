@@ -31,11 +31,37 @@ type Client struct {
 	state       State
 	key         *rsa.PrivateKey
 	certificate *x509.Certificate
+	proxyURL    string
 	connection  net.Conn
 	writeMu     sync.Mutex
 }
 
 func NewClient(state State) (*Client, error) {
+	proxyURL, err := processProxyURL()
+	if err != nil {
+		return nil, err
+	}
+	return newClient(state, proxyURL)
+}
+
+// ValidateState checks the APS credentials without resolving a proxy route or
+// opening a network connection.
+func ValidateState(state State) error {
+	_, err := newClient(state, "")
+	return err
+}
+
+// NewClientForAccount creates an APS connection pinned to the account's
+// persisted proxy-pool assignment without changing process environment.
+func NewClientForAccount(state State, accountDir string) (*Client, error) {
+	proxyURL, err := accountProxyURL(accountDir)
+	if err != nil {
+		return nil, err
+	}
+	return newClient(state, proxyURL)
+}
+
+func newClient(state State, proxyURL string) (*Client, error) {
 	if len(state.Token) != 0 && len(state.Token) != 32 {
 		return nil, errors.New("aps: saved token must be 32 bytes")
 	}
@@ -56,7 +82,7 @@ func NewClient(state State) (*Client, error) {
 		return nil, errors.New("aps: client push certificate is outside its validity period")
 	}
 	state.Token = append([]byte(nil), state.Token...)
-	return &Client{state: state, key: key, certificate: certificate}, nil
+	return &Client{state: state, key: key, certificate: certificate, proxyURL: proxyURL}, nil
 }
 
 func (c *Client) State() State {
@@ -76,7 +102,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	if c.connection != nil {
 		return errors.New("aps: connection is already open")
 	}
-	connection, err := dialCourier(ctx, "1-courier.push.apple.com:5223")
+	connection, err := dialCourierWithProxy(ctx, "1-courier.push.apple.com:5223", c.proxyURL)
 	if err != nil {
 		return errors.New("aps: courier connection failed")
 	}

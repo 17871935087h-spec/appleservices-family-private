@@ -65,7 +65,8 @@ func fetchStorefrontPlanAt(ctx context.Context, endpoint, appleID, dsid, adsid, 
 		request.Header.Set("X-Mme-Timezone", time.Now().Location().String())
 	}
 	request.Header.Set("User-Agent", "iCloud/15.8.118 Windows/10.0 build/26100 maker/Microsoft model/PC hwp/x64 AOSKit/282 iCloudSettings/1.0")
-	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := appleHTTPClient(ctx, 30*time.Second)
+	defer client.CloseIdleConnections()
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, &StorageError{Stage: "plan-transport"}
@@ -174,7 +175,8 @@ func FetchStoragePlanInfo(ctx context.Context, sd map[string]any, appleID, dsid,
 	request.Header.Set("X-MMe-Language", "en")
 	request.Header.Set("Accept", "application/x-plist, application/json")
 	request.Header.Set("User-Agent", "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0")
-	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := appleHTTPClient(ctx, 30*time.Second)
+	defer client.CloseIdleConnections()
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, &StorageError{Stage: "plan-transport"}

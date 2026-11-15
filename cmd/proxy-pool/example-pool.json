@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "max_accounts_per_exit": 1,
+  "nodes": [
+    {
+      "id": "replace-with-a-real-node-id",
+      "url": "http://proxy.example.invalid:8080",
+      "exit_ip": "192.0.2.10",
+      "enabled": false
+    }
+  ],
+  "assignments": {}
+}
