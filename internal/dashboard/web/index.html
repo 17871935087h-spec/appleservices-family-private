@@ -11,6 +11,8 @@
   <script src="/primary-mail.js" defer></script>
   <link rel="stylesheet" href="/app-passwords.css">
   <script src="/app-passwords.js" defer></script>
+  <link rel="stylesheet" href="/proxy-pool.css">
+  <script src="/proxy-pool.js" defer></script>
 </head>
 <body>
 <aside class="sidebar">
@@ -20,6 +22,7 @@
     <a href="#overview" class="nav-item selected"><span class="nav-icon">◫</span>概览<span class="nav-marker"></span></a>
     <a href="#devices" class="nav-item"><span class="nav-icon">▱</span>我的设备<span class="nav-count" id="navCount">—</span></a>
     <a href="#requests" class="nav-item"><span class="nav-icon">◇</span>登录请求<span class="request-dot" id="requestDot" hidden></span></a>
+    <a href="#proxy-pool" class="nav-item"><span class="nav-icon" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h15m-4-4 4 4-4 4M20 17H5m4-4-4 4 4 4"/></svg></span>独立代理池</a>
   </nav>
   <div class="account-switcher">
     <div class="account-switcher-head"><span class="nav-label">账号</span><button type="button" id="addAccountButton" title="添加账号">＋</button></div>
@@ -149,6 +152,60 @@
   <section class="verification-banner overview-only" id="pairingPanel" hidden><div><span class="card-kicker dark">设备配对验证</span><h3>输入受信任设备显示的配对码</h3><p>项目通过 APS 和 GSA 完成证明交换，不启动官方客户端。</p></div><form id="pairingForm"><input id="pairingCode" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="六位配对码" aria-label="六位配对码" required><button class="button button-primary" type="submit">发送配对证明</button></form></section>
   <section id="devices" class="devices-section"><div class="section-heading"><div><span class="section-kicker">已关联的设备</span><h2>我的设备 <span id="deviceCount">—</span></h2></div><button class="text-button" id="devicesButton" disabled>↻<span>刷新设备</span></button></div><div class="device-grid" id="deviceGrid"><div class="empty-state">正在读取设备列表…</div></div><div class="section-footnote"><span class="footnote-dot"></span><span id="deviceUpdate">设备列表与 Apple 账户同步</span></div></section>
   <section class="lower-grid"><article class="request-card" id="requests"><div class="card-title-row"><h3>登录请求</h3><span class="subtle-tag" id="requestTag">等待请求</span></div><div class="request-content" id="requestContent"><span class="request-symbol">✓</span><div><strong id="requestTitle">没有待处理的登录请求</strong><p id="requestText">收到新的请求时，它会出现在这里。</p></div></div><div class="request-actions" id="requestActions" hidden><button class="button button-primary" id="allowButton">允许并显示验证码</button><button class="button button-outline" id="denyButton">拒绝</button></div></article><article class="activity-card overview-activity"><div class="card-title-row"><h3>最近动态</h3><span class="subtle-label">本次打开</span></div><div id="activityList" class="activity-list"><p class="empty-activity">状态变化会显示在这里</p></div></article></section>
+  <section id="proxy-pool" class="proxy-pool-section" aria-labelledby="proxyPoolTitle">
+    <div class="proxy-pool-heading">
+      <div><h2 id="proxyPoolTitle">独立代理池</h2><p>为账号分配已验证的网络出口。代理凭据仅在输入后提交，不写入浏览器存储。</p></div>
+      <span id="proxyPoolBadge" class="proxy-pool-badge" data-state="loading"><i></i>正在读取</span>
+    </div>
+    <p id="proxyPoolSummary" class="proxy-pool-summary" role="status" aria-live="polite" aria-atomic="true">正在读取代理池状态…</p>
+    <div class="proxy-pool-toolbar">
+      <button type="button" class="button button-light" id="proxyPoolRefresh">刷新状态</button>
+      <button type="button" class="button button-primary" id="proxyPoolApply" disabled>启用并应用到账号</button>
+      <span>应用时会自动停止旧后台，并仅恢复已保存的会话；不会索取 Apple 密码或验证码。</span>
+    </div>
+    <p id="proxyPoolFeedback" class="proxy-pool-feedback" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+
+    <form id="proxyPoolNodeForm" class="proxy-pool-form" novalidate>
+      <div class="proxy-pool-form-heading"><div><h3 id="proxyPoolFormTitle">添加代理节点</h3><p>逐个添加；不支持订阅地址、SS 或 VLESS。</p></div></div>
+      <div class="proxy-pool-form-grid">
+        <label for="proxyPoolNodeId">节点名称<input id="proxyPoolNodeId" maxlength="128" autocomplete="off" placeholder="例如：东京出口 1" required></label>
+        <label for="proxyPoolNodeURL">代理 URL<input id="proxyPoolNodeURL" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="http://user:password@proxy.example:8080" aria-describedby="proxyPoolURLHelp"></label>
+        <label class="proxy-pool-enabled" for="proxyPoolNodeEnabled"><input id="proxyPoolNodeEnabled" type="checkbox" checked>启用此节点</label>
+        <button type="submit" class="button button-primary" id="proxyPoolNodeSubmit">测试并保存</button>
+      </div>
+      <p id="proxyPoolURLHelp" class="proxy-pool-help">名称保存后固定。支持 http、https、socks5、socks5h；编辑时 URL 留空会保留凭据并重新测试出口。列表只显示协议、主机与端口。</p>
+    </form>
+
+    <div class="proxy-pool-settings">
+      <div><h3>出口容量</h3><p>同一真实出口 IP 最多绑定的账号数。</p></div>
+      <form id="proxyPoolSettingsForm">
+        <label for="proxyPoolMaxAccounts">每出口账号上限</label>
+        <input id="proxyPoolMaxAccounts" type="number" min="1" max="50000" step="1" value="1" required>
+        <button type="submit" class="button button-light" id="proxyPoolSettingsSubmit">保存设置</button>
+      </form>
+    </div>
+
+    <section class="proxy-pool-list" aria-labelledby="proxyPoolNodesTitle">
+      <div class="proxy-pool-list-heading"><div><h3 id="proxyPoolNodesTitle">代理节点</h3><p>出口 IP 为服务端最近一次对代理的测试结果。</p></div><span id="proxyPoolNodeCount">—</span></div>
+      <div class="proxy-pool-table-wrap">
+        <table class="proxy-pool-table">
+          <thead><tr><th scope="col">节点名称</th><th scope="col">代理地址</th><th scope="col">已测出口 IP</th><th scope="col">绑定账号</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead>
+          <tbody id="proxyPoolNodes"><tr><td colspan="6">正在读取节点…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="proxy-pool-list" aria-labelledby="proxyPoolAccountsTitle">
+      <div class="proxy-pool-list-heading"><div><h3 id="proxyPoolAccountsTitle">账号应用状态</h3><p>显示当前账号所用节点、已测出口 IP 和后台状态。</p></div></div>
+      <div class="proxy-pool-table-wrap">
+        <table class="proxy-pool-table proxy-pool-account-table">
+          <thead><tr><th scope="col">账号</th><th scope="col">代理节点</th><th scope="col">已测出口 IP</th><th scope="col">账号后台</th><th scope="col">代理应用</th></tr></thead>
+          <tbody id="proxyPoolAccounts"><tr><td colspan="5">正在读取账号状态…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+    <p class="proxy-pool-limitation">已有账号可迁移；全新设备初始化暂不支持代理。</p>
+  </section>
   <footer class="page-footer"><span>appleservices <span class="footer-separator">/</span> 本机设备控制台</span><span id="lastUpdated">正在连接后台</span></footer>
 </main>
 <dialog id="loginDialog"><form id="loginForm" class="dialog-form"><div class="dialog-top"><span class="dialog-icon">a</span><button class="dialog-close" type="button" id="closeLogin" aria-label="关闭">×</button></div><div class="eyebrow">恢复你的工作空间</div><h2>连接 Apple 账户</h2><p>沿用这台电脑已有的设备身份。密码仅用于本次登录。</p><label for="appleID">Apple 账户</label><input id="appleID" name="apple_id" type="email" autocomplete="username" placeholder="你的账户邮箱" required><label for="password">密码</label><input id="password" name="password" type="password" autocomplete="off" placeholder="输入账户密码" required><label for="twofactor">首次验证方式</label><select id="twofactor" name="twofactor"><option value="trusted-device">受信任设备验证码（推荐）</option><option value="sms">发送新的短信验证码</option><option value="sms-existing">使用已有短信码（不重新发送）</option><option value="circle">受信任设备配对</option></select><button class="button button-primary dialog-submit" type="submit">登录并保持在线<span>→</span></button><div class="dialog-note">配对方式只走项目协议，不启动官方 iCloud 窗口。</div></form></dialog>

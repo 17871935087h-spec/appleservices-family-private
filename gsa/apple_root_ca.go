@@ -30,7 +30,10 @@ func AppleRootTransport() http.RoundTripper {
 		// A worker that inherited a configured pool must have had its account
 		// route installed before it creates a client. Never let a missing route
 		// silently fall back to the machine's ordinary egress.
-		return blockedAppleTransport()
+		snapshot, err := egresspool.Inspect()
+		if err != nil || snapshot.Enabled {
+			return blockedAppleTransport()
+		}
 	}
 	if raw := strings.TrimSpace(os.Getenv("APPLESERVICES_SOCKS_PROXY")); raw != "" {
 		transport, err := AppleRootTransportForProxy(legacySOCKSURL(raw))
@@ -53,10 +56,12 @@ func AppleRootTransportForAccount(accountDir string) (*http.Transport, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !route.Enabled || strings.TrimSpace(route.URL) == "" {
-			return nil, errors.New("gsa: configured proxy pool returned no account route")
+		if route.Enabled {
+			if strings.TrimSpace(route.URL) == "" {
+				return nil, errors.New("gsa: configured proxy pool returned no account route")
+			}
+			return AppleRootTransportForProxy(route.URL)
 		}
-		return AppleRootTransportForProxy(route.URL)
 	}
 	if raw := strings.TrimSpace(os.Getenv(AccountProxyEnv)); raw != "" {
 		return AppleRootTransportForProxy(raw)

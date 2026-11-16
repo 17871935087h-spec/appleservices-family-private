@@ -386,8 +386,11 @@ func TestInspectDoesNotExposeProxyURLs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(encoded), "secret") || strings.Contains(string(encoded), "proxy.example") {
+	if strings.Contains(string(encoded), "secret") || strings.Contains(string(encoded), "user:secret@") {
 		t.Fatalf("inspection output leaked proxy URL: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), "proxy.example:8080") {
+		t.Fatal("inspection output omitted the sanitized endpoint")
 	}
 	if len(snapshot.Nodes) != 1 || len(snapshot.Assignments) != 1 || len(snapshot.Nodes[0].AssignedAccounts) != 1 {
 		t.Fatalf("incomplete safe summary: %#v", snapshot)

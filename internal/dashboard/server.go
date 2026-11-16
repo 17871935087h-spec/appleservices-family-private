@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Laky-64/appleservices/icloud"
@@ -65,6 +66,11 @@ type Server struct {
 	primaryMailRunner      func(context.Context, *Account, primaryMailInput) primaryMailState
 	familyCredentialLoader func(string, string) (string, error)
 	appPasswords           *appPasswordService
+	proxyPoolMu            sync.Mutex
+	proxyPoolApplying      atomic.Bool
+	proxyPoolProbe         func(context.Context, string) (string, error)
+	proxyPoolStop          func(context.Context, *Account) error
+	proxyPoolResume        func(context.Context, *Account) control.Result
 }
 type Status struct {
 	PID                  int       `json:"pid"`
@@ -1309,6 +1315,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"message":"请刷新面板后重试"}`, 403)
 			return
 		}
+		if s.handleProxyPoolAPI(w, r) {
+			return
+		}
+		if r.Method != http.MethodGet && s.proxyPoolApplying.Load() {
+			json.NewEncoder(w).Encode(control.Result{Message: "正在应用账号代理，请等待完成后再操作", Stage: "proxy-applying"})
+			return
+		}
 		if s.handlePrimaryMailAPI(w, r) {
 			return
 		}
@@ -1542,6 +1555,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	case "/app-passwords.css":
 		file = "app-passwords.css"
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	case "/proxy-pool.js":
+		file = "proxy-pool.js"
+		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	case "/proxy-pool.css":
+		file = "proxy-pool.css"
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
 	default:
 		http.NotFound(w, r)

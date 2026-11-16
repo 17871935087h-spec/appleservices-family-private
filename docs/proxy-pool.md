@@ -11,9 +11,37 @@ Keep this file outside the checkout, for example
 service identity and administrators: proxy URLs may contain credentials.
 Never commit a real configuration.
 
+## Dashboard management
+
+Open **独立代理池** in the Windows service panel (also available through V2's
+Windows service page). Enter a node label and HTTP/HTTPS/SOCKS5 proxy URL, then
+choose **测试并保存**. The server checks the actual HTTPS exit and the Apple push
+TLS tunnel on TCP 5223 without logging into an account. Node credentials are
+write-only in the UI; editing with an empty URL preserves the saved credential.
+The panel displays only protocol, endpoint, observed exit, check time and bound
+account labels. Subscription links and SS/VLESS configurations are not accepted
+as HTTP/SOCKS proxy URLs.
+
+A newly installed management configuration has `"enabled": false` and may have
+an empty node list. Saving nodes does not switch existing traffic. The explicit
+**启用并应用到账号** action checks capacity for every registered account before
+stopping workers, enables the pool, and restores only account-private saved
+sessions. Accounts requiring credentials or verification remain pending. The
+panel reports applied only when a live worker publishes the assigned node and
+exit; a queued restart is not reported as applied. New account workers then
+receive stable assignments automatically, within the bootstrap limit below.
+
+The endpoints `/api/proxy-pool/status`, `/node`, `/remove`, `/settings` and
+`/apply` use the dashboard's existing capability and origin checks. All writes
+use the server-configured private path; no client-supplied filesystem path is
+accepted. Configuration writes remain locked and atomic. Assigned nodes cannot
+be deleted or changed to another URL/exit. Keep the independent pool separate
+from registrar subscriptions and leases.
+
 ```json
 {
   "version": 1,
+  "enabled": true,
   "max_accounts_per_exit": 1,
   "nodes": [
     {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Laky-64/appleservices/gsa"
 	"github.com/Laky-64/appleservices/internal/egresspool"
 	"golang.org/x/net/proxy"
 )
@@ -37,7 +39,10 @@ func processProxyURL() (string, error) {
 		return validateProxyURL(raw)
 	}
 	if strings.TrimSpace(os.Getenv(egresspool.PoolEnv)) != "" {
-		return "", errors.New("aps: proxy pool requires an applied account route")
+		snapshot, err := egresspool.Inspect()
+		if err != nil || snapshot.Enabled {
+			return "", errors.New("aps: proxy pool requires an applied account route")
+		}
 	}
 	if raw := strings.TrimSpace(os.Getenv("APPLESERVICES_SOCKS_PROXY")); raw != "" {
 		return validateProxyURL(legacySOCKSURL(raw))
@@ -51,12 +56,43 @@ func accountProxyURL(accountDir string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if !route.Enabled || strings.TrimSpace(route.URL) == "" {
-			return "", errors.New("aps: configured proxy pool returned no account route")
+		if route.Enabled {
+			if strings.TrimSpace(route.URL) == "" {
+				return "", errors.New("aps: configured proxy pool returned no account route")
+			}
+			return validateProxyURL(route.URL)
 		}
-		return validateProxyURL(route.URL)
 	}
 	return processProxyURL()
+}
+
+// CheckProxy verifies the courier tunnel and server TLS identity, then closes
+// without sending a device identity or authenticating an Apple account.
+func CheckProxy(ctx context.Context, raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return errors.New("aps: explicit proxy is required")
+	}
+	proxyURL, err := validateProxyURL(raw)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	connection, err := dialCourierWithProxy(ctx, "1-courier.push.apple.com:5223", proxyURL)
+	if err != nil {
+		return errors.New("aps: proxy courier tunnel is unavailable")
+	}
+	defer connection.Close()
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		pool = x509.NewCertPool()
+	}
+	pool.AppendCertsFromPEM([]byte(gsa.AppleRootCAPEM))
+	secure := tls.Client(connection, &tls.Config{RootCAs: pool, ServerName: "courier.push.apple.com", NextProtos: []string{"apns-security-v3"}, MinVersion: tls.VersionTLS12})
+	if err := secure.HandshakeContext(ctx); err != nil {
+		return errors.New("aps: proxy courier TLS check failed")
+	}
+	return nil
 }
 
 func legacySOCKSURL(raw string) string {

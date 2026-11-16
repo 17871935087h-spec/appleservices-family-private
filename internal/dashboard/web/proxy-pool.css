@@ -1,0 +1,101 @@
+main:not(.view-proxy-pool) #proxy-pool{display:none}
+main.view-proxy-pool> :not(header):not(#notice):not(#proxy-pool){display:none!important}
+main.view-proxy-pool .page-header h1,main.view-proxy-pool .page-header p{font-size:0}
+main.view-proxy-pool .page-header h1:after{content:"独立代理池";display:inline;width:auto;height:auto;margin:0;border-radius:0;background:none;box-shadow:none;font-size:24px;animation:none;vertical-align:baseline}
+main.view-proxy-pool .page-header p:after{content:"管理已验证的代理出口和账号应用状态。";font-size:12px}
+
+.proxy-pool-section{--quiet:#5c6c7f;--muted:#526174;min-width:0;padding:0 0 24px;color:var(--text)}
+.proxy-pool-heading,.proxy-pool-toolbar,.proxy-pool-form-heading,.proxy-pool-settings,.proxy-pool-list-heading{display:flex;align-items:center;justify-content:space-between;gap:14px}
+.proxy-pool-heading{margin:2px 0 12px}
+.proxy-pool-heading h2{margin:0;font-size:18px;font-weight:700;letter-spacing:-.02em}
+.proxy-pool-heading p,.proxy-pool-form-heading p,.proxy-pool-settings p,.proxy-pool-list-heading p{margin:5px 0 0;color:var(--muted);font-size:12px;line-height:1.55}
+.proxy-pool-badge{flex:0 0 auto;display:inline-flex;align-items:center;gap:7px;padding:6px 9px;border:1px solid var(--line);border-radius:6px;background:#f1f4f7;color:#5f6d7a;font-size:12px;font-weight:650}
+.proxy-pool-badge i{width:7px;height:7px;border-radius:50%;background:#9aa7b5}
+.proxy-pool-badge[data-state="enabled"]{border-color:#c7e5d8;background:var(--green-soft);color:#176649}
+.proxy-pool-badge[data-state="enabled"] i{background:var(--green)}
+.proxy-pool-badge[data-state="unconfigured"]{border-color:#dce3e9;background:#f5f7f9;color:#657384}
+.proxy-pool-badge[data-state="disabled"]{border-color:#f0d7ad;background:var(--amber-soft);color:var(--amber)}
+.proxy-pool-badge[data-state="disabled"] i{background:#d68d28}
+.proxy-pool-badge[data-state="applying"]{border-color:#f0d7ad;background:var(--amber-soft);color:#80520c}
+.proxy-pool-badge[data-state="applying"] i{background:#d68d28;animation:proxyPoolPulse 1.4s ease-in-out infinite alternate}
+.proxy-pool-badge[data-state="error"]{border-color:#f1caca;background:var(--red-soft);color:#983939}
+.proxy-pool-badge[data-state="error"] i{background:var(--red)}
+.proxy-pool-summary{margin:0 0 10px;color:#506074;font-size:12px;line-height:1.6}
+.proxy-pool-toolbar{justify-content:flex-start;flex-wrap:wrap;padding:0 0 13px;border-bottom:1px solid var(--line)}
+.proxy-pool-toolbar>span{margin-left:auto;color:var(--quiet);font-size:12px;line-height:1.5}
+.proxy-pool-toolbar .button{min-height:34px}
+.proxy-pool-feedback{margin:10px 0 0;padding:9px 11px;border:1px solid #cce8dc;border-radius:6px;background:var(--green-soft);color:#176649;font-size:12px;line-height:1.5}
+.proxy-pool-feedback[data-tone="error"]{border-color:#f1caca;background:var(--red-soft);color:#983939}
+.proxy-pool-form{margin-top:15px;padding:0 0 15px;border-bottom:1px solid var(--line)}
+.proxy-pool-form-heading{margin-bottom:9px}
+.proxy-pool-section h3{margin:0;font-size:12px;font-weight:680}
+.proxy-pool-form-grid{display:grid;grid-template-columns:minmax(150px,.9fr) minmax(250px,1.7fr) auto auto;align-items:end;gap:9px}
+.proxy-pool-form-grid>label,.proxy-pool-settings form>label{display:grid;gap:5px;color:#46566a;font-size:12px;font-weight:650}
+.proxy-pool-form-grid input:not([type="checkbox"]),.proxy-pool-settings input{width:100%;min-width:0;height:36px;font-size:12px}
+.proxy-pool-section input::placeholder{color:#657384;opacity:1}
+.proxy-pool-form-grid input[type="password"]{font-family:Consolas,"Cascadia Mono",monospace;font-size:12px}
+.proxy-pool-form-grid .proxy-pool-enabled{height:36px;display:flex;align-items:center;gap:7px;white-space:nowrap}
+.proxy-pool-enabled input[type="checkbox"]{width:15px;height:15px;margin:0;accent-color:var(--blue)}
+.proxy-pool-form-grid .button{height:36px}
+.proxy-pool-help{margin:8px 0 0;color:var(--quiet);font-size:12px;line-height:1.55}
+.proxy-pool-settings{padding:12px 0;border-bottom:1px solid var(--line)}
+.proxy-pool-settings form{display:flex;align-items:end;gap:8px}
+.proxy-pool-settings form>label{min-width:134px}
+.proxy-pool-settings input{max-width:112px}
+.proxy-pool-settings form .button{height:36px}
+.proxy-pool-list{margin-top:14px}
+.proxy-pool-list-heading{margin-bottom:8px}
+.proxy-pool-list-heading>span{color:var(--quiet);font-size:12px;font-variant-numeric:tabular-nums}
+.proxy-pool-table-wrap{width:100%;min-width:0;overflow:hidden;border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:#fff}
+.proxy-pool-table{width:100%;border-collapse:collapse;table-layout:fixed;font-size:12px}
+.proxy-pool-table th{padding:8px 9px;background:#f5f7fa;color:#596a7d;font-size:12px;font-weight:700;text-align:left}
+.proxy-pool-table td{padding:9px;border-top:1px solid #e8edf1;color:#354659;vertical-align:middle;overflow-wrap:anywhere}
+.proxy-pool-table th:nth-child(1){width:15%}.proxy-pool-table th:nth-child(2){width:24%}.proxy-pool-table th:nth-child(3){width:15%}.proxy-pool-table th:nth-child(4){width:20%}.proxy-pool-table th:nth-child(5){width:12%}.proxy-pool-table th:nth-child(6){width:14%}
+.proxy-pool-endpoint{font:12px Consolas,"Cascadia Mono",monospace;color:#354659;overflow-wrap:anywhere}
+.proxy-pool-ip{font:12px Consolas,"Cascadia Mono",monospace;font-variant-numeric:tabular-nums}
+.proxy-pool-meta{display:block;margin-top:3px;color:#5f6d7b;font-size:12px}
+.proxy-pool-message{display:block;margin-top:4px;color:#4f5d6c;font-size:12px;line-height:1.45;overflow-wrap:anywhere}
+.proxy-pool-state{display:inline-flex;align-items:center;gap:5px;color:#586675;font-size:12px;white-space:nowrap}
+.proxy-pool-state:before{content:"";width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:#aeb8c2}
+.proxy-pool-state.on{color:#176649}.proxy-pool-state.on:before{background:var(--green)}
+.proxy-pool-state.off{color:#586675}
+.proxy-pool-actions{display:flex;align-items:center;gap:3px;flex-wrap:wrap}
+.proxy-pool-actions .text-button{font-size:12px}
+.proxy-pool-actions .text-button:disabled{color:#765c5c;border-color:transparent;background:transparent;opacity:1}
+.proxy-pool-empty{text-align:center;color:var(--quiet)!important;font-size:12px}
+.proxy-pool-limitation{margin:12px 0 0;color:#586675;font-size:12px;line-height:1.5}
+.proxy-pool-account-table th:nth-child(1){width:25%}.proxy-pool-account-table th:nth-child(2){width:22%}.proxy-pool-account-table th:nth-child(3){width:21%}.proxy-pool-account-table th:nth-child(4){width:15%}.proxy-pool-account-table th:nth-child(5){width:17%}
+
+@media(max-width:900px){
+  .proxy-pool-form-grid{grid-template-columns:minmax(130px,.8fr) minmax(220px,1.4fr)}
+  .proxy-pool-form-grid .proxy-pool-enabled{grid-column:1}
+  .proxy-pool-form-grid #proxyPoolNodeSubmit{grid-column:2;justify-self:start}
+  .proxy-pool-toolbar>span{flex-basis:100%;margin-left:0}
+}
+@media(max-width:760px){
+  .proxy-pool-section{padding-bottom:16px}
+  .proxy-pool-heading{align-items:flex-start}
+  .proxy-pool-heading p{max-width:48ch}
+  .proxy-pool-form-grid{grid-template-columns:minmax(0,1fr)}
+  .proxy-pool-form-grid .proxy-pool-enabled,.proxy-pool-form-grid #proxyPoolNodeSubmit{grid-column:auto}
+  .proxy-pool-form-grid #proxyPoolNodeSubmit{width:100%}
+  .proxy-pool-settings{align-items:flex-start;flex-direction:column}
+  .proxy-pool-settings form{width:100%;flex-wrap:wrap}
+  .proxy-pool-settings form>label{flex:1 1 135px}
+  .proxy-pool-settings input{max-width:none}
+  .proxy-pool-settings form .button{flex:0 0 auto}
+  .proxy-pool-table-wrap{border:0;background:transparent}
+  .proxy-pool-table,.proxy-pool-table tbody{display:block;width:100%}
+  .proxy-pool-table thead{position:absolute;width:1px;height:1px;padding:0;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;clip-path:inset(50%)}
+  .proxy-pool-table tr{display:block;margin:0 0 9px;border:1px solid var(--line);border-radius:7px;background:#fff;overflow:hidden}
+  .proxy-pool-table td{display:grid;grid-template-columns:minmax(88px,32%) minmax(0,1fr);gap:8px;padding:8px 10px;border-top:1px solid #edf0f3;font-size:12px}
+  .proxy-pool-table td:first-child{border-top:0}
+  .proxy-pool-table td:before{content:attr(data-label);color:var(--quiet);font-size:12px;font-weight:650}
+  .proxy-pool-table td.proxy-pool-empty{display:block}
+  .proxy-pool-table td.proxy-pool-empty:before{content:none}
+  .proxy-pool-actions{justify-content:flex-start}
+  .proxy-pool-list-heading{align-items:flex-end}
+}
+@keyframes proxyPoolPulse{to{opacity:.48}}
+
+#proxy-pool .button,#proxy-pool .text-button{font-size:12px}#proxy-pool input{caret-color:var(--blue)}

@@ -1,5 +1,5 @@
-// Package egresspool assigns each account directory to a persistent proxy node.
-// It deliberately does not probe nodes or perform network requests.
+// Package egresspool assigns account directories to persistent proxy nodes and
+// manages sanitized pool metadata. Network probes are explicitly injected.
 package egresspool
 
 import (
@@ -35,10 +35,11 @@ const (
 // Route is the selected route for one account. URL contains proxy credentials
 // when configured and is intentionally excluded from automatic JSON output.
 type Route struct {
-	Enabled bool   `json:"enabled"`
-	NodeID  string `json:"node_id,omitempty"`
-	URL     string `json:"-"`
-	ExitIP  string `json:"exit_ip,omitempty"`
+	Enabled        bool   `json:"enabled"`
+	NodeID         string `json:"node_id,omitempty"`
+	URL            string `json:"-"`
+	ExitIP         string `json:"exit_ip,omitempty"`
+	inactiveByPool bool
 }
 
 func (r Route) String() string {
@@ -48,26 +49,31 @@ func (r Route) String() string {
 func (r Route) GoString() string { return r.String() }
 
 type config struct {
+	Enabled            *bool             `json:"enabled,omitempty"`
 	Version            int               `json:"version"`
 	Nodes              []node            `json:"nodes"`
 	MaxAccountsPerExit int               `json:"max_accounts_per_exit,omitempty"`
-	Assignments        map[string]string `json:"assignments,omitempty"`
+	Assignments        map[string]string `json:"assignments"`
 }
 
 type node struct {
-	ID      string `json:"id"`
-	URL     string `json:"url"`
-	ExitIP  string `json:"exit_ip"`
-	Enabled bool   `json:"enabled"`
+	ID        string     `json:"id"`
+	URL       string     `json:"url"`
+	ExitIP    string     `json:"exit_ip"`
+	Enabled   bool       `json:"enabled"`
+	CheckedAt *time.Time `json:"checked_at,omitempty"`
 }
 
 // NodeSummary and Assignment are safe-to-display views that never include
 // proxy URLs or credentials.
 type NodeSummary struct {
-	ID               string   `json:"id"`
-	ExitIP           string   `json:"exit_ip"`
-	Enabled          bool     `json:"enabled"`
-	AssignedAccounts []string `json:"assigned_accounts"`
+	ID               string     `json:"id"`
+	ExitIP           string     `json:"exit_ip"`
+	Enabled          bool       `json:"enabled"`
+	Scheme           string     `json:"scheme"`
+	Endpoint         string     `json:"endpoint"`
+	CheckedAt        *time.Time `json:"checked_at,omitempty"`
+	AssignedAccounts []string   `json:"assigned_accounts"`
 }
 
 type Assignment struct {
@@ -77,6 +83,7 @@ type Assignment struct {
 }
 
 type Snapshot struct {
+	Enabled            bool          `json:"enabled"`
 	MaxAccountsPerExit int           `json:"max_accounts_per_exit"`
 	Nodes              []NodeSummary `json:"nodes"`
 	Assignments        []Assignment  `json:"assignments"`
@@ -90,10 +97,6 @@ func Resolve(accountDir string) (Route, error) {
 	if poolPath == "" {
 		return Route{Enabled: false}, nil
 	}
-	account, err := canonicalAccount(accountDir)
-	if err != nil {
-		return Route{}, err
-	}
 	lock, err := acquireFileLock(poolPath+".lock", defaultLockWait)
 	if err != nil {
 		return Route{}, fmt.Errorf("proxy pool lock unavailable")
@@ -105,6 +108,13 @@ func Resolve(accountDir string) (Route, error) {
 		return Route{}, err
 	}
 	validated, err := validateConfig(&cfg)
+	if err != nil {
+		return Route{}, err
+	}
+	if !configEnabled(cfg) {
+		return Route{Enabled: false, inactiveByPool: true}, nil
+	}
+	account, err := canonicalAccount(accountDir)
 	if err != nil {
 		return Route{}, err
 	}
@@ -168,6 +178,9 @@ func Environment(base []string, accountDir string) ([]string, error) {
 		return nil, err
 	}
 	if !route.Enabled {
+		if route.inactiveByPool {
+			result = withoutEnvironmentKeys(result, PoolEnv, "APPLESERVICES_ACCOUNT_PROXY")
+		}
 		return result, nil
 	}
 	result = withoutProxyEnvironment(result)
@@ -185,8 +198,16 @@ func Environment(base []string, accountDir string) ([]string, error) {
 // must use Environment to construct each worker's child environment instead.
 func Apply(accountDir string) error {
 	route, err := Resolve(accountDir)
-	if err != nil || !route.Enabled {
+	if err != nil {
 		return err
+	}
+	if !route.Enabled {
+		if route.inactiveByPool {
+			if err := unsetEnvironmentKeys(PoolEnv, "APPLESERVICES_ACCOUNT_PROXY"); err != nil {
+				return fmt.Errorf("could not clear inactive proxy environment")
+			}
+		}
+		return nil
 	}
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
@@ -230,17 +251,24 @@ func Inspect() (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	snapshot := Snapshot{MaxAccountsPerExit: cfg.MaxAccountsPerExit, Nodes: make([]NodeSummary, 0, len(validated.ordered))}
+	return snapshotFromConfig(cfg, validated), nil
+}
+
+func snapshotFromConfig(cfg config, validated validatedConfig) Snapshot {
+	snapshot := Snapshot{
+		Enabled:            configEnabled(cfg),
+		MaxAccountsPerExit: cfg.MaxAccountsPerExit,
+		Nodes:              make([]NodeSummary, 0, len(validated.ordered)),
+		Assignments:        make([]Assignment, 0, len(cfg.Assignments)),
+	}
 	byID := make(map[string]int, len(validated.ordered))
 	for _, item := range validated.ordered {
-		snapshot.Nodes = append(snapshot.Nodes, NodeSummary{ID: item.source.ID, ExitIP: item.source.ExitIP, Enabled: item.source.Enabled, AssignedAccounts: []string{}})
+		parsed, _ := url.Parse(item.source.URL) // validateConfig already checked the URL.
+		snapshot.Nodes = append(snapshot.Nodes, NodeSummary{ID: item.source.ID, ExitIP: item.source.ExitIP, Enabled: item.source.Enabled, Scheme: parsed.Scheme, Endpoint: parsed.Host, CheckedAt: item.source.CheckedAt, AssignedAccounts: []string{}})
 		byID[item.source.ID] = len(snapshot.Nodes) - 1
 	}
 	for account, nodeID := range cfg.Assignments {
 		item := validated.byID[nodeID]
-		if item == nil {
-			return Snapshot{}, fmt.Errorf("proxy pool assignment references an unavailable node")
-		}
 		snapshot.Assignments = append(snapshot.Assignments, Assignment{Account: account, NodeID: nodeID, ExitIP: item.source.ExitIP})
 		nodeIndex := byID[nodeID]
 		snapshot.Nodes[nodeIndex].AssignedAccounts = append(snapshot.Nodes[nodeIndex].AssignedAccounts, account)
@@ -249,7 +277,7 @@ func Inspect() (Snapshot, error) {
 	for i := range snapshot.Nodes {
 		sort.Strings(snapshot.Nodes[i].AssignedAccounts)
 	}
-	return snapshot, nil
+	return snapshot
 }
 
 type validatedNode struct {
@@ -269,6 +297,9 @@ type validatedConfig struct {
 func loadConfig(path string) (config, error) {
 	file, err := os.Open(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return config{}, fmt.Errorf("could not read proxy pool config: %w", os.ErrNotExist)
+		}
 		return config{}, fmt.Errorf("could not read proxy pool config")
 	}
 	defer file.Close()
@@ -307,6 +338,12 @@ func validateConfig(cfg *config) (validatedConfig, error) {
 	if len(cfg.Assignments) > maxAssignments {
 		return validatedConfig{}, fmt.Errorf("proxy pool has too many assignments")
 	}
+	if cfg.Nodes == nil {
+		cfg.Nodes = []node{}
+	}
+	if cfg.Assignments == nil {
+		cfg.Assignments = make(map[string]string)
+	}
 	validated := validatedConfig{ordered: make([]*validatedNode, 0, len(cfg.Nodes)), byID: make(map[string]*validatedNode, len(cfg.Nodes))}
 	for index, item := range cfg.Nodes {
 		if strings.TrimSpace(item.ID) == "" || strings.TrimSpace(item.ID) != item.ID || len(item.ID) > maxNodeIDBytes || hasControl(item.ID) {
@@ -324,12 +361,15 @@ func validateConfig(cfg *config) (validatedConfig, error) {
 		if ip == nil {
 			return validatedConfig{}, fmt.Errorf("proxy pool node %d has an invalid exit_ip", index)
 		}
+		if item.CheckedAt != nil && item.CheckedAt.IsZero() {
+			return validatedConfig{}, fmt.Errorf("proxy pool node %d has invalid checked_at", index)
+		}
 		item.ExitIP = ip.String()
 		entry := &validatedNode{source: item, exitKey: ip.String()}
 		validated.ordered = append(validated.ordered, entry)
 		validated.byID[item.ID] = entry
 	}
-	if len(validated.ordered) == 0 {
+	if len(validated.ordered) == 0 && configEnabled(*cfg) {
 		return validatedConfig{}, fmt.Errorf("proxy pool has no nodes")
 	}
 	loads := make(map[string]int)
@@ -347,6 +387,10 @@ func validateConfig(cfg *config) (validatedConfig, error) {
 		}
 	}
 	return validated, nil
+}
+
+func configEnabled(cfg config) bool {
+	return cfg.Enabled == nil || *cfg.Enabled
 }
 
 func supportedScheme(scheme string) bool {
@@ -471,6 +515,39 @@ func withoutProxyEnvironment(base []string) []string {
 		}
 	}
 	return filtered
+}
+
+func withoutEnvironmentKeys(base []string, keys ...string) []string {
+	filtered := make([]string, 0, len(base))
+	for _, entry := range base {
+		key, _, _ := strings.Cut(entry, "=")
+		remove := false
+		for _, candidate := range keys {
+			if strings.EqualFold(key, candidate) {
+				remove = true
+				break
+			}
+		}
+		if !remove {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+func unsetEnvironmentKeys(keys ...string) error {
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		for _, candidate := range keys {
+			if strings.EqualFold(key, candidate) {
+				if err := os.Unsetenv(key); err != nil {
+					return err
+				}
+				break
+			}
+		}
+	}
+	return nil
 }
 
 func isProxyEnvironmentKey(key string) bool {
