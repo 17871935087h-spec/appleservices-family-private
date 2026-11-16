@@ -2,6 +2,8 @@ package dashboard
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -136,12 +138,102 @@ func (s *Server) activationPlan(ctx context.Context, account *Account, runDir st
 	root := s.activationRoot()
 	helper := filepath.Join(filepath.Dir(s.config.Worker), "accountsetupcheck.exe")
 	dump := filepath.Join(runDir, "setup.html")
-	output, err := runActivationCommand(ctx, root, account.Dir, account.AppleID, helper,
+	output, err := s.runActivation(ctx, root, account.Dir, account.AppleID, helper,
 		"-dir", account.Dir, "-resume", filepath.Join(account.Dir, "session.json"), "-dump", dump)
 	if err != nil {
 		return nil, errors.New("无法读取 Apple 当前条款状态")
 	}
 	return parseActivationPlan(output)
+}
+
+func (s *Server) runActivation(ctx context.Context, root, dir, appleID, executable string, args ...string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.activationRunner != nil {
+		return s.activationRunner(ctx, root, dir, appleID, executable, args...)
+	}
+	return runActivationCommand(ctx, root, dir, appleID, executable, args...)
+}
+
+func (s *Server) activationStorageInfo(ctx context.Context, account *Account) control.Result {
+	if s.activationStorage != nil {
+		return s.activationStorage(ctx, account, false)
+	}
+	return s.acceptedStorageAction(ctx, account, false)
+}
+
+// This receipt proves only an acknowledged terms update. It contains no Apple
+// credentials and cannot substitute for the separate delegate/quota checkpoint.
+type activationTermsReceipt struct {
+	Version int       `json:"version"`
+	Binding string    `json:"binding"`
+	Tuple   string    `json:"tuple"`
+	At      time.Time `json:"confirmed_at"`
+}
+
+func activationTermsBinding(account *Account) string {
+	if account == nil || !verifiedGSACheckpointReady(account.Dir, account.AppleID) {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(account.Dir, "session.json"))
+	if err != nil || len(data) > 2<<20 {
+		return ""
+	}
+	var session appleservices.Session
+	if json.Unmarshal(data, &session) != nil || session.DSID == "" || !strings.EqualFold(session.AppleID, account.AppleID) {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(account.AppleID)) + "\x00" + session.DSID))
+	return hex.EncodeToString(digest[:])
+}
+
+func readActivationTermsReceipt(account *Account) (activationTermsReceipt, bool) {
+	var receipt activationTermsReceipt
+	if account == nil {
+		return receipt, false
+	}
+	data, err := os.ReadFile(filepath.Join(account.Dir, "icloud-activation-terms.json"))
+	if err != nil || len(data) > 4096 || json.Unmarshal(data, &receipt) != nil {
+		return receipt, false
+	}
+	binding := activationTermsBinding(account)
+	return receipt, receipt.Version == 1 && binding != "" && receipt.Binding == binding && receipt.Tuple != "" && !receipt.At.IsZero()
+}
+
+func confirmedActivationTermsReceiptReady(account *Account) bool {
+	_, ok := readActivationTermsReceipt(account)
+	return ok
+}
+
+func saveActivationTermsReceipt(account *Account, tuple string) error {
+	binding := activationTermsBinding(account)
+	if binding == "" || tuple == "" {
+		return errors.New("activation terms identity unavailable")
+	}
+	receipt := activationTermsReceipt{Version: 1, Binding: binding, Tuple: tuple, At: time.Now().UTC()}
+	data, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(account.Dir, "icloud-activation-terms.json")
+	temp, err := os.CreateTemp(account.Dir, ".activation-terms-*")
+	if err != nil {
+		return err
+	}
+	name := temp.Name()
+	defer os.Remove(name)
+	if err = temp.Chmod(0600); err == nil {
+		_, err = temp.Write(data)
+	}
+	if err == nil {
+		err = temp.Sync()
+	}
+	err = errors.Join(err, temp.Close())
+	if err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 func readTermsReceipt(path string) bool {
@@ -152,7 +244,14 @@ func readTermsReceipt(path string) bool {
 	var receipt struct {
 		Success bool `json:"success"`
 	}
-	return json.Unmarshal(data, &receipt) == nil && receipt.Success
+	if json.Unmarshal(data, &receipt) != nil || !receipt.Success {
+		return false
+	}
+	metadata, err := os.ReadFile(strings.TrimSuffix(path, ".json") + "-meta.json")
+	var status struct {
+		HTTP int `json:"HTTP"`
+	}
+	return err == nil && len(metadata) < 4096 && json.Unmarshal(metadata, &status) == nil && status.HTTP == 200
 }
 
 func installAcceptedCheckpoint(source, destination string) error {
@@ -170,11 +269,21 @@ func installAcceptedCheckpoint(source, destination string) error {
 }
 
 func (s *Server) activationAction(parent context.Context, account *Account, accept bool, approvedTuple string) control.Result {
+	return s.activationActionMode(parent, account, accept, approvedTuple, false)
+}
+
+// The installation flag opts into the owner's requested login-to-activation
+// workflow. The browser never needs to initiate or keep this operation alive.
+func (s *Server) automaticActivationAction(parent context.Context, account *Account) control.Result {
+	return s.activationActionMode(parent, account, true, "", true)
+}
+
+func (s *Server) activationActionMode(parent context.Context, account *Account, accept bool, approvedTuple string, automatic bool) control.Result {
 	if account == nil || !verifiedGSACheckpointReady(account.Dir, account.AppleID) {
 		return control.Result{Message: "请先完成账号密码与验证码验证", Stage: "activation-session"}
 	}
 	if acceptedCheckpointReady(account.Dir, account.AppleID) {
-		result := s.acceptedStorageAction(parent, account, false)
+		result := s.activationStorageInfo(parent, account)
 		result.Activation = &control.ActivationInfo{Completed: result.OK}
 		return result
 	}
@@ -198,41 +307,56 @@ func (s *Server) activationAction(parent context.Context, account *Account, acce
 	if !accept {
 		return control.Result{OK: true, Message: "Apple 要求接受当前 iCloud 与媒体服务条款", Stage: "activation-terms", Activation: plan}
 	}
+	if automatic {
+		approvedTuple = activationTuple(plan)
+	}
 	if approvedTuple == "" || approvedTuple != activationTuple(plan) {
 		return control.Result{Message: "Apple 条款版本已变化，请重新查看并确认", Stage: "activation-consent", Activation: plan}
 	}
 	helper := filepath.Join(filepath.Dir(s.config.Worker), "accountsetupcheck.exe")
-	termsDump := filepath.Join(runDir, "terms.html")
-	_, _ = runActivationCommand(ctx, root, account.Dir, account.AppleID, helper,
-		"-dir", account.Dir, "-resume", filepath.Join(account.Dir, "session.json"), "-accept-terms", "-expected-terms", approvedTuple, "-dump", termsDump)
-	if !readTermsReceipt(termsDump + ".update.json") {
-		return control.Result{Message: "Apple 未确认条款接受状态", Stage: "activation-terms", Activation: plan}
+	receipt, termsConfirmed := readActivationTermsReceipt(account)
+	if termsConfirmed && receipt.Tuple != approvedTuple {
+		return control.Result{Message: "Apple 条款版本已变化，需要重新核对", Stage: "activation-consent", Activation: plan}
+	}
+	if !termsConfirmed {
+		termsDump := filepath.Join(runDir, "terms.html")
+		_, _ = s.runActivation(ctx, root, account.Dir, account.AppleID, helper,
+			"-dir", account.Dir, "-resume", filepath.Join(account.Dir, "session.json"), "-accept-terms", "-expected-terms", approvedTuple, "-dump", termsDump)
+		if !readTermsReceipt(termsDump + ".update.json") {
+			return control.Result{Message: "Apple 未确认条款接受状态", Stage: "activation-terms", Activation: plan}
+		}
+		if err := saveActivationTermsReceipt(account, approvedTuple); err != nil {
+			return control.Result{Message: "条款已确认，但本地验收状态未保存", Stage: "activation-terms-save", Activation: plan}
+		}
+	}
+	if ctx.Err() != nil {
+		return control.Result{Message: "激活已取消，已保留条款确认状态", Stage: "activation-followup-retry"}
 	}
 	runtimeSource := filepath.Join(root, ".cache", "mac-nac-runtime")
 	runtimeCopy := filepath.Join(runDir, "nac-runtime")
 	if err := copyActivationTree(runtimeSource, runtimeCopy); err != nil {
-		return control.Result{Message: "无法准备 Mac NAC 运行时", Stage: "activation-nac"}
+		return control.Result{Message: "无法准备 Mac NAC 运行时", Stage: "activation-followup-retry"}
 	}
 	validation := filepath.Join(runDir, "nac-validation.bin")
-	nacOutput, nacErr := runActivationCommand(ctx, root, account.Dir, account.AppleID, s.config.Python,
+	nacOutput, nacErr := s.runActivation(ctx, root, account.Dir, account.AppleID, s.config.Python,
 		filepath.Join(root, "tools", "mac-nac-check.py"), "--profile", filepath.Join(account.Dir, "native-adi", "hw_info.plist"),
 		"--runtime", runtimeCopy, "--encrypt-dll", filepath.Join(root, ".cache", "activation-source-review", "mac-io-encrypt.dll"),
 		"--validation-out", validation, "--synthetic-missing-board-fields", "--transport", filepath.Join(filepath.Dir(s.config.Worker), "nacexchange.exe"))
 	if nacErr != nil || !strings.Contains(string(nacOutput), `"stage": "NACSign"`) {
-		return control.Result{Message: "Mac NAC 生成未完成", Stage: "activation-nac"}
+		return control.Result{Message: "Mac NAC 生成未完成", Stage: "activation-followup-retry"}
 	}
 	checkpoint := filepath.Join(runDir, "icloud-accepted.json")
-	delegateOutput, delegateErr := runActivationCommand(ctx, root, account.Dir, account.AppleID, helper,
+	delegateOutput, delegateErr := s.runActivation(ctx, root, account.Dir, account.AppleID, helper,
 		"-dir", account.Dir, "-resume", filepath.Join(account.Dir, "session.json"), "-delegate-only", "-terms-accepted",
 		"-nac-validation", validation, "-dump", filepath.Join(runDir, "delegate.plist"), "-icloud-checkpoint", checkpoint)
 	if delegateErr != nil || !strings.Contains(string(delegateOutput), "delegate accepted; mme-token-present=true") || !strings.Contains(string(delegateOutput), "quota accepted;") {
-		return control.Result{Message: "Apple 尚未接受 Mac v2/NAC 激活", Stage: "activation-delegate"}
+		return control.Result{Message: "Apple 尚未接受 Mac v2/NAC 激活", Stage: "activation-followup-retry"}
 	}
 	destination := filepath.Join(account.Dir, "icloud-accepted.json")
 	if err := installAcceptedCheckpoint(checkpoint, destination); err != nil && !acceptedCheckpointReady(account.Dir, account.AppleID) {
 		return control.Result{Message: "激活成功，但本地验收状态未保存", Stage: "activation-save"}
 	}
-	result := s.acceptedStorageAction(ctx, account, false)
+	result := s.activationStorageInfo(ctx, account)
 	if !result.OK {
 		return result
 	}

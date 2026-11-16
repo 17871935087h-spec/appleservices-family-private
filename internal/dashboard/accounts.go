@@ -32,19 +32,20 @@ type Account struct {
 }
 
 type AccountView struct {
-	ID                     string `json:"id"`
-	Name                   string `json:"name"`
-	Account                string `json:"account"`
-	State                  string `json:"state"`
-	Running                bool   `json:"running"`
-	Authenticated          bool   `json:"authenticated"`
-	ICloudActivated        bool   `json:"icloud_activated"`
-	FamilyMember           bool   `json:"family_member,omitempty"`
-	FamilyOrganizer        bool   `json:"family_organizer,omitempty"`
-	FamilyOrganizerAccount string `json:"family_organizer_account,omitempty"`
-	FamilyStale            bool   `json:"family_stale"`
-	FamilyCheckedAt        string `json:"family_checked_at,omitempty"`
-	Message                string `json:"message,omitempty"`
+	ID                     string                  `json:"id"`
+	Name                   string                  `json:"name"`
+	Account                string                  `json:"account"`
+	State                  string                  `json:"state"`
+	Running                bool                    `json:"running"`
+	Authenticated          bool                    `json:"authenticated"`
+	ICloudActivated        bool                    `json:"icloud_activated"`
+	FamilyMember           bool                    `json:"family_member,omitempty"`
+	FamilyOrganizer        bool                    `json:"family_organizer,omitempty"`
+	FamilyOrganizerAccount string                  `json:"family_organizer_account,omitempty"`
+	FamilyStale            bool                    `json:"family_stale"`
+	FamilyCheckedAt        string                  `json:"family_checked_at,omitempty"`
+	Message                string                  `json:"message,omitempty"`
+	Automation             *ICloudAutomationStatus `json:"automation,omitempty"`
 }
 
 // registry is the on-disk account list.

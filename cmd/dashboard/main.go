@@ -17,6 +17,7 @@ func main() {
 	python := flag.String("python", "python", "64-bit Python executable")
 	macPushSetup := flag.String("mac-push-setup", "./tools/mac-push-check.py", "account-isolated Mac APS bootstrap")
 	port := flag.Int("port", 18741, "loopback dashboard port")
+	autoICloudSetup := flag.Bool("auto-icloud-setup", false, "automatically activate iCloud and restore the saved session after account login")
 	flag.Parse()
 	absDir, _ := filepath.Abs(*dir)
 	absWorker, _ := filepath.Abs(*worker)
@@ -24,7 +25,7 @@ func main() {
 	absMacPushSetup, _ := filepath.Abs(*macPushSetup)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	server, err := dashboard.New(dashboard.Config{Dir: absDir, Worker: absWorker, Library: absLibrary, Python: *python, MacPushSetup: absMacPushSetup, Port: *port})
+	server, err := dashboard.New(dashboard.Config{Dir: absDir, Worker: absWorker, Library: absLibrary, Python: *python, MacPushSetup: absMacPushSetup, Port: *port, AutoICloudSetup: *autoICloudSetup})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

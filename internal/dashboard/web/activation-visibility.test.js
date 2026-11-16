@@ -70,6 +70,7 @@ const renderActivationSource = extractFunction(appSource, 'renderActivation')
 function createHarness(options = {}) {
   const elements = new Map()
   const effects = { fetch: 0, action: 0, accept: 0 }
+  const timeValues = []
   const selectedAccount = options.selectedAccount ?? 'account-a'
   const context = {
     selectedAccount,
@@ -77,6 +78,7 @@ function createHarness(options = {}) {
     activationInfo: options.activationInfo ?? null,
     busy: options.busy ?? false,
     current: null,
+    time (value) { timeValues.push(value); return value ? '09:14' : '—' },
     $ (id) {
       if (!elements.has(id)) {
         const attributes = new Map()
@@ -109,6 +111,7 @@ function createHarness(options = {}) {
   return {
     context,
     effects,
+    timeValues,
     element: (id) => context.$(id),
     render: (view) => context.renderActivation(view),
   }
@@ -160,6 +163,94 @@ test('shows a manual check when ready and no terms need acceptance', () => {
   assert.equal(harness.element('activationCheckButton').hidden, false)
   assert.equal(harness.element('activationCheckButton').disabled, false)
   assert.equal(harness.element('activationAcceptButton').hidden, true)
+})
+
+test('shows selected-account automation progress and hides manual activation actions', () => {
+  const harness = createHarness({ activationInfo: requiredActivation })
+  const updatedAt = '2026-11-16T01:02:03Z'
+  harness.render({
+    selected: 'account-a',
+    accounts: [{ id: 'account-a', automation: {
+      enabled: true,
+      stage: 'activating',
+      running: true,
+      message: '正在检查并激活 iCloud 服务',
+      updated_at: updatedAt,
+    } }],
+    activation_ready: true,
+    icloud_activated: false,
+  })
+
+  assert.equal(harness.element('activationCard').hidden, false)
+  assert.equal(harness.element('activationState').textContent, '运行中 · 正在激活 iCloud')
+  assert.equal(harness.element('activationSummary').textContent, '正在检查并激活 iCloud 服务')
+  assert.equal(harness.element('activationUpdatedAt').textContent, '最近更新 09:14')
+  assert.deepEqual(harness.timeValues, [updatedAt])
+  assert.equal(harness.element('activationCheckButton').hidden, true)
+  assert.equal(harness.element('activationAcceptButton').hidden, true)
+  assertNoStaleTerms(harness)
+  assert.deepEqual(harness.effects, { fetch: 0, action: 0, accept: 0 })
+})
+
+test('shows a stopped verification-required stage without enabling manual activation', () => {
+  const harness = createHarness()
+  harness.render({
+    selected: 'account-a',
+    accounts: [{ id: 'account-a', automation: {
+      enabled: true,
+      stage: 'verification-required',
+      running: false,
+      message: '恢复会话需要手动账号验证',
+      updated_at: '2026-11-16T01:02:03Z',
+    } }],
+    activation_ready: true,
+    icloud_activated: false,
+  })
+
+  assert.equal(harness.element('activationState').textContent, '待处理 · 等待账号验证')
+  assert.equal(harness.element('activationSummary').textContent, '恢复会话需要手动账号验证')
+  assert.equal(harness.element('activationCheckButton').hidden, true)
+  assert.equal(harness.element('activationAcceptButton').hidden, true)
+  assert.deepEqual(harness.effects, { fetch: 0, action: 0, accept: 0 })
+})
+
+test('uses root automation progress when no selected AccountView is available', () => {
+  const harness = createHarness()
+  harness.render({
+    selected: 'account-a',
+    automation: {
+      enabled: true,
+      stage: 'activation-followup',
+      running: true,
+      message: '正在核验已保存的 iCloud 服务状态',
+      updated_at: '2026-11-16T01:02:03Z',
+    },
+    activation_ready: false,
+    icloud_activated: true,
+  })
+
+  assert.equal(harness.element('activationState').textContent, '运行中 · 激活后的状态核验')
+  assert.equal(harness.element('activationSummary').textContent, '正在核验已保存的 iCloud 服务状态')
+  assert.equal(harness.element('activationCheckButton').hidden, true)
+  assert.equal(harness.element('activationAcceptButton').hidden, true)
+})
+
+test('keeps the manual flow when automation is disabled for the selected account', () => {
+  const harness = createHarness()
+  harness.render({
+    selected: 'account-a',
+    accounts: [
+      { id: 'account-b', automation: { enabled: true, stage: 'activating', running: true } },
+      { id: 'account-a', automation: { enabled: false, stage: 'waiting-login', running: false } },
+    ],
+    activation_ready: true,
+    icloud_activated: false,
+  })
+
+  assert.equal(harness.element('activationCheckButton').hidden, false)
+  assert.equal(harness.element('activationCheckButton').disabled, false)
+  assert.equal(harness.element('activationAcceptButton').hidden, true)
+  assert.equal(harness.element('activationUpdatedAt').hidden, true)
 })
 
 test('shows acceptance only for required terms and disables both controls while busy', () => {

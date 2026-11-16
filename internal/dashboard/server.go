@@ -35,6 +35,7 @@ var assets embed.FS
 type Config struct {
 	Dir, Worker, Library, Python, MacPushSetup string
 	Port                                       int
+	AutoICloudSetup                            bool
 }
 type Server struct {
 	config    Config
@@ -71,6 +72,10 @@ type Server struct {
 	proxyPoolProbe         func(context.Context, string) (string, error)
 	proxyPoolStop          func(context.Context, *Account) error
 	proxyPoolResume        func(context.Context, *Account) control.Result
+	icloudAutomation       *iCloudAutomationService
+	activationRunner       func(context.Context, string, string, string, string, ...string) ([]byte, error)
+	activationStorage      func(context.Context, *Account, bool) control.Result
+	accountLifecycleMu     sync.Mutex
 }
 type Status struct {
 	PID                  int       `json:"pid"`
@@ -118,6 +123,7 @@ type view struct {
 	HideMyEmailAvailable      bool                    `json:"hide_my_email_available"`
 	HideMyEmailUpdateRequired bool                    `json:"hide_my_email_update_required"`
 	ActivationReady           bool                    `json:"activation_ready"`
+	Automation                *ICloudAutomationStatus `json:"automation,omitempty"`
 }
 type credentials struct {
 	AppleID   string `json:"apple_id"`
@@ -153,6 +159,9 @@ func New(config Config) (*Server, error) {
 	clear(refKey)
 	s.provisionMacPush = s.runMacPushProvisioner
 	s.appPasswords = newAppPasswordService(s)
+	if config.AutoICloudSetup {
+		s.icloudAutomation = newICloudAutomationService(s)
+	}
 	if entries, err := loadRegistry(config.Dir, config.Dir); err != nil {
 		// Surfaced rather than swallowed: an unreadable registry previously
 		// made the panel look like it had no accounts at all.
@@ -202,6 +211,9 @@ func (s *Server) listAccounts(ctx context.Context) []AccountView {
 		item := AccountView{ID: account.ID, Name: account.Name, Account: maskAccount(account.AppleID),
 			State: status.State, Running: status.Running, Authenticated: status.Authenticated,
 			ICloudActivated: acceptedCheckpointReady(account.Dir, account.AppleID)}
+		if s.icloudAutomation != nil {
+			item.Automation = s.icloudAutomation.Status(account)
+		}
 		if family, checkedAt, stale := readFamilyCache(account); family != nil {
 			s.resolveCachedFamilyOrganizer(account, family)
 			item.FamilyMember = family.Member
@@ -272,32 +284,41 @@ func (s *Server) addAccount(ctx context.Context, creds credentials) (control.Res
 // removeAccount stops one account and unregisters it. Its directory is kept on
 // disk so its device identity is not destroyed by an accidental click.
 func (s *Server) removeAccount(ctx context.Context, id string) control.Result {
-	s.accountsMu.Lock()
-	var target *Account
-	remaining := make([]*registryEntry, 0, len(s.accounts))
-	for _, account := range s.accounts {
-		if account.ID == id {
-			target = account
-			continue
-		}
-		remaining = append(remaining, &registryEntry{ID: account.ID, Name: account.Name, AppleID: account.AppleID, Dir: account.Dir, CreatedAt: account.CreatedAt})
+	s.accountLifecycleMu.Lock()
+	defer s.accountLifecycleMu.Unlock()
+	if id == "" {
+		return control.Result{Message: "账号不存在"}
 	}
-	s.accountsMu.Unlock()
+	target := s.lookup(id)
 	if target == nil {
 		return control.Result{Message: "账号不存在"}
+	}
+	if s.icloudAutomation != nil {
+		if err := s.icloudAutomation.Pause(ctx, target); err != nil {
+			return control.Result{Message: "自动激活任务尚未停止，请稍后重试", Stage: "automation-stopping"}
+		}
 	}
 	if err := s.stopIn(ctx, target.Dir); err != nil {
 		return control.Result{Message: "请先停止该账号的后台"}
 	}
+	// Account creation can finish while cancellation/worker shutdown is in
+	// progress. Build the registry from the current list under its write lock,
+	// never from a snapshot taken before that wait.
+	s.accountsMu.Lock()
+	defer s.accountsMu.Unlock()
+	remaining := make([]*registryEntry, 0, len(s.accounts))
+	accounts := make([]*Account, 0, len(s.accounts))
+	for _, account := range s.accounts {
+		if account.ID == id {
+			continue
+		}
+		remaining = append(remaining, &registryEntry{ID: account.ID, Name: account.Name, AppleID: account.AppleID, Dir: account.Dir, CreatedAt: account.CreatedAt})
+		accounts = append(accounts, account)
+	}
 	if err := saveRegistry(s.config.Dir, remaining); err != nil {
 		return control.Result{Message: "无法保存账号列表"}
 	}
-	s.accountsMu.Lock()
-	s.accounts = nil
-	for _, entry := range remaining {
-		s.accounts = append(s.accounts, &Account{ID: entry.ID, Name: entry.Name, AppleID: entry.AppleID, Dir: entry.Dir, CreatedAt: entry.CreatedAt})
-	}
-	s.accountsMu.Unlock()
+	s.accounts = accounts
 	return control.Result{OK: true, Message: "已从列表移除，设备身份仍保留在 accounts/" + target.ID}
 }
 
@@ -959,6 +980,9 @@ func (s *Server) snapshotFor(ctx context.Context, id string) view {
 		result.LoginAccount = account.AppleID
 		result.ICloudActivated = acceptedCheckpointReady(account.Dir, account.AppleID)
 		result.ActivationReady = !result.ICloudActivated && verifiedGSACheckpointReady(account.Dir, account.AppleID)
+		if s.icloudAutomation != nil {
+			result.Automation = s.icloudAutomation.Status(account)
+		}
 		if family, checkedAt, stale := readFamilyCache(account); family != nil {
 			s.resolveCachedFamilyOrganizer(account, family)
 			result.Family = family
@@ -1009,6 +1033,8 @@ func (s *Server) Start(ctx context.Context, creds credentials) control.Result {
 
 // startAccount starts one registered account inside its own directory.
 func (s *Server) startAccount(ctx context.Context, account *Account, creds credentials) control.Result {
+	s.accountLifecycleMu.Lock()
+	defer s.accountLifecycleMu.Unlock()
 	if account == nil {
 		return control.Result{Message: "账号不存在"}
 	}
@@ -1017,6 +1043,15 @@ func (s *Server) startAccount(ctx context.Context, account *Account, creds crede
 	}
 	if !strings.EqualFold(strings.TrimSpace(creds.AppleID), account.AppleID) {
 		return control.Result{Message: "登录账号与所选工作区不一致，请使用添加账号"}
+	}
+	current := s.lookup(account.ID)
+	if current == nil || filepath.Clean(current.Dir) != filepath.Clean(account.Dir) || !strings.EqualFold(current.AppleID, account.AppleID) {
+		return control.Result{Message: "账号已从列表移除，未启动后台", Stage: "account-removed"}
+	}
+	if s.icloudAutomation != nil {
+		if err := s.icloudAutomation.Reset(ctx, account); err != nil {
+			return control.Result{Message: "正在结束该账号之前的自动激活任务，请稍后重试", Stage: "automation-stopping"}
+		}
 	}
 	return s.startIn(ctx, account.Dir, creds, account)
 }
@@ -1200,6 +1235,9 @@ func (s *Server) setMessage(account *Account, message string) {
 }
 
 func (s *Server) Bootstrap(ctx context.Context, appleID, password string) {
+	if s.icloudAutomation != nil {
+		go s.icloudAutomation.Run(ctx)
+	}
 	if appleID != "" && password != "" {
 		go func() {
 			result := s.Start(ctx, credentials{AppleID: appleID, Password: password})
@@ -1211,6 +1249,9 @@ func (s *Server) Bootstrap(ctx context.Context, appleID, password string) {
 		}()
 	}
 	go func() {
+		if s.icloudAutomation != nil {
+			return
+		}
 		s.accountsMu.Lock()
 		accounts := append([]*Account(nil), s.accounts...)
 		s.accountsMu.Unlock()
@@ -1374,6 +1415,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !readJSON(w, r, &body) {
 				return
 			}
+			s.accountLifecycleMu.Lock()
+			defer s.accountLifecycleMu.Unlock()
 			if body.Account == "" {
 				body.Account = r.URL.Query().Get("account")
 			}
@@ -1390,6 +1433,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				dir = account.Dir
+				if s.icloudAutomation != nil {
+					if err := s.icloudAutomation.Pause(r.Context(), account); err != nil {
+						json.NewEncoder(w).Encode(control.Result{Message: "自动激活任务尚未停止，请稍后查看", Stage: "automation-stopping"})
+						return
+					}
+				}
 			}
 			result := control.Result{OK: true, Message: "后台已停止，登录状态已保留"}
 			if err := s.stopIn(r.Context(), dir); err != nil {

@@ -73,6 +73,31 @@ function renderFamily(info,{checkedAt='',stale=false,animate=true}={}){
 }
 function resetHME(){hmeInfo=null;hmeAccount='';hmeCandidate='';hmeVisible=100;hmeEditing='';setHMEFeedback('');$('hmeCandidatePanel').hidden=true;$('hmeReachablePanel').hidden=true;$('hmeReachableCodeForm').hidden=true;$('hmeReachableEmail').value='';$('hmeReachableCode').value='';$('hmeSearch').value='';renderHME(null);}
 function renderActivation(view){
+  const accountID=view?.selected||selectedAccount,accountView=(view?.accounts||[]).find(account=>account.id===accountID),automation=accountView?.automation||view?.automation;
+  if(automation?.enabled){
+    const stageLabels={
+      'waiting-login':'等待手动登录','settling-login':'等待登录稳定','activating':'正在激活 iCloud',
+      'resume-pending':'准备恢复账号后台','waiting-worker':'等待账号后台就绪','verification-required':'等待账号验证',
+      'retry-wait':'等待自动重试','resume-delayed':'恢复后台稍后重试','resuming':'正在恢复账号后台',
+      'resume-unconfirmed':'恢复结果待核对','preflight-exhausted':'激活前检查暂停','activation-followup':'激活后的状态核验','needs-review':'等待人工核对',
+      'journal-error':'自动化状态保存失败','paused':'自动化已暂停','complete':'自动激活完成','unavailable':'自动化状态不可用'
+    };
+    const stage=String(automation.stage||''),stageLabel=stageLabels[stage]||stage||'等待后端状态';
+    const runLabel=automation.running?'运行中':stage==='complete'?'已完成':stage==='paused'?'已暂停':'待处理';
+    const updatedAt=automation.updated_at?time(automation.updated_at):'';
+    activationInfo=null;activationAccount='';
+    $('activationCard').hidden=false;
+    $('activationState').textContent=runLabel+' · '+stageLabel;
+    $('activationSummary').textContent=automation.message||stageLabel;
+    $('activationVersions').textContent='';$('activationVersions').hidden=true;
+    for(const id of ['activationICloudTerms','activationMediaTerms']){const link=$(id);link.hidden=true;link.removeAttribute('href');}
+    $('activationUpdatedAt').textContent=updatedAt&&updatedAt!=='—'?'最近更新 '+updatedAt:'尚无后端状态更新时间';
+    $('activationUpdatedAt').hidden=false;
+    $('activationCheckButton').hidden=true;$('activationCheckButton').disabled=true;
+    $('activationAcceptButton').hidden=true;$('activationAcceptButton').disabled=true;
+    return;
+  }
+  $('activationUpdatedAt').textContent='';$('activationUpdatedAt').hidden=true;
   const activated=!!view?.icloud_activated,account=!!(view?.selected||selectedAccount),ready=account&&!!view?.activation_ready&&!activated;
   if(!ready||(activationAccount&&activationAccount!==selectedAccount)){activationInfo=null;activationAccount='';}
   const terms=ready&&!!activationInfo?.required;
