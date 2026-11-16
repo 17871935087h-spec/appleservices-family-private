@@ -484,6 +484,9 @@ func run() (runErr error) {
 			fmt.Fprintln(os.Stderr, "Saved identity renewal did not complete; existing account state was retained.")
 		}
 	}
+	if errors.Is(err, errVerificationRequired) {
+		return stopResumedSessionOnVerification(true, true, &status, *dir)
+	}
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -603,6 +606,11 @@ func run() (runErr error) {
 			status.State = "refresh_failed"
 			if errors.Is(err, errVerificationRequired) {
 				status.State, status.VerificationRequired = "verification_required", true
+				status.Authenticated = false
+				if panel != nil {
+					panel.SetReady(false)
+				}
+				cancel()
 			}
 			status.save(*dir)
 			return control.Result{Message: "续登录失败，请检查登录状态"}
@@ -645,6 +653,9 @@ func run() (runErr error) {
 		return hmeClient.List(actionCtx)
 	}
 	performAction := func(actionCtx context.Context, action, visibleRequestID, commandCode, commandLabel, commandNote, commandTargetAppleID, commandTargetPassword string) control.Result {
+		if ctx.Err() != nil {
+			return control.Result{Stage: "worker-stopping", Message: "后台已停止，未执行操作"}
+		}
 		if action == "hme-accept-terms" {
 			queryCtx, done := context.WithTimeout(actionCtx, 115*time.Second)
 			defer done()
@@ -1337,6 +1348,9 @@ func run() (runErr error) {
 		return control.Result{OK: true, Code: code, HideAt: time.Now().Add(time.Minute).UTC(), Message: "操作已完成"}
 	}
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		select {
 		case <-ctx.Done():
 			if errors.Is(ctx.Err(), context.Canceled) || (*listenFor > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded)) {
