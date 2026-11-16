@@ -209,7 +209,8 @@ func (s *Server) listAccounts(ctx context.Context) []AccountView {
 	for _, account := range accounts {
 		status := s.accountStatus(account)
 		item := AccountView{ID: account.ID, Name: account.Name, Account: maskAccount(account.AppleID),
-			State: status.State, Running: status.Running, Authenticated: status.Authenticated,
+			State: status.State, Running: status.Running, PushConnected: status.PushConnected,
+			Authenticated: status.Authenticated, VerificationRequired: status.VerificationRequired,
 			ICloudActivated: acceptedCheckpointReady(account.Dir, account.AppleID)}
 		if s.icloudAutomation != nil {
 			item.Automation = s.icloudAutomation.Status(account)
@@ -1140,6 +1141,9 @@ func (s *Server) startInMode(ctx context.Context, dir string, creds credentials,
 	command.Args = append(command.Args, "-twofactor", creds.TwoFactor)
 	if resume {
 		command.Args = append(command.Args, "-resume-session")
+	}
+	if s.config.AutoICloudSetup {
+		command.Args = append(command.Args, "-reauthenticate-saved-session")
 	}
 	configureProcess(command)
 	for _, entry := range workerEnv {

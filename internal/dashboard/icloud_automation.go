@@ -19,7 +19,7 @@ const (
 	iCloudAutomationJournalFile = "icloud-automation.json"
 	iCloudAutomationPollEvery   = 2 * time.Second
 	iCloudAutomationStableFor   = 2 * time.Second
-	iCloudAutomationWorkerWait  = 2 * time.Minute
+	iCloudAutomationWorkerWait  = 4 * time.Minute
 	iCloudAutomationRetryBase   = 2 * time.Second
 	iCloudAutomationMaxTries    = 3
 )
@@ -43,6 +43,7 @@ type iCloudAutomationJournal struct {
 	Submitted           bool      `json:"submitted,omitempty"`
 	RestartPending      bool      `json:"restart_pending,omitempty"`
 	RestartFromPID      int       `json:"restart_from_pid,omitempty"`
+	RecoveryVersion     int       `json:"recovery_version,omitempty"`
 	Attempts            int       `json:"attempts,omitempty"`
 	FollowupAttempts    int       `json:"followup_attempts,omitempty"`
 	RetryAt             time.Time `json:"retry_at,omitempty"`
@@ -92,6 +93,7 @@ type iCloudAutomationService struct {
 	stableFor  time.Duration
 	workerWait time.Duration
 	retryBase  time.Duration
+	runSlots   chan struct{}
 }
 
 func newICloudAutomationService(server *Server) *iCloudAutomationService {
@@ -102,6 +104,7 @@ func newICloudAutomationService(server *Server) *iCloudAutomationService {
 		stableFor:  iCloudAutomationStableFor,
 		workerWait: iCloudAutomationWorkerWait,
 		retryBase:  iCloudAutomationRetryBase,
+		runSlots:   make(chan struct{}, 1),
 	}
 	service.deps = iCloudAutomationDependencies{
 		accounts: func() []*Account {
@@ -408,7 +411,7 @@ func (service *iCloudAutomationService) schedule(parent context.Context, account
 		entry.mu.Unlock()
 		return
 	}
-	if entry.journal.Stage == "resume-unconfirmed" || entry.journal.Stage == "verification-required" ||
+	if (entry.journal.Stage == "resume-unconfirmed" && entry.journal.RecoveryVersion >= 1 && !completedOnline) || entry.journal.Stage == "verification-required" ||
 		(!accepted && (entry.journal.Stage == "preflight-exhausted" || entry.journal.Stage == "complete" || entry.journal.Stage == "needs-review")) {
 		entry.mu.Unlock()
 		return
@@ -436,6 +439,14 @@ func (service *iCloudAutomationService) schedule(parent context.Context, account
 			entry.mu.Unlock()
 			close(done)
 		}()
+		if service.runSlots != nil {
+			select {
+			case service.runSlots <- struct{}{}:
+				defer func() { <-service.runSlots }()
+			case <-runCtx.Done():
+				return
+			}
+		}
 		service.runAccount(runCtx, account, entry, generation)
 	}()
 }
@@ -743,6 +754,7 @@ func (service *iCloudAutomationService) resumeAccepted(ctx context.Context, acco
 	}
 	service.update(account, entry, generation, func(value *iCloudAutomationJournal) {
 		value.Stage = "resuming"
+		value.RecoveryVersion = 1
 		value.Message = "正在使用已保存会话恢复账号后台"
 	})
 	if !service.canContinue(ctx, account, entry, generation) {

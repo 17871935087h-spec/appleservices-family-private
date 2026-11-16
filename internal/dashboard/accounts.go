@@ -37,7 +37,9 @@ type AccountView struct {
 	Account                string                  `json:"account"`
 	State                  string                  `json:"state"`
 	Running                bool                    `json:"running"`
+	PushConnected          bool                    `json:"push_connected"`
 	Authenticated          bool                    `json:"authenticated"`
+	VerificationRequired   bool                    `json:"verification_required"`
 	ICloudActivated        bool                    `json:"icloud_activated"`
 	FamilyMember           bool                    `json:"family_member,omitempty"`
 	FamilyOrganizer        bool                    `json:"family_organizer,omitempty"`

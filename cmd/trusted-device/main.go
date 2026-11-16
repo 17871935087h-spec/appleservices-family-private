@@ -67,6 +67,7 @@ func run() (runErr error) {
 	controlAPI := flag.Bool("control-api", false, "enable authenticated local dashboard control")
 	guiAuth := flag.Bool("gui-auth", false, "complete initial two-factor verification through the dashboard")
 	resumeSession := flag.Bool("resume-session", false, "restore the account-bound GSA and accepted iCloud sessions without a password")
+	reauthenticateSavedSession := flag.Bool("reauthenticate-saved-session", false, "repair an expired saved device identity using this account's encrypted credential; stop on verification")
 	flag.Parse()
 	*method = normalizeTwoFactorMethod(*method)
 	if *background {
@@ -450,12 +451,39 @@ func run() (runErr error) {
 	}
 	var active maintainedLogin = login
 	accountID := client.ADSID
+	identityRecovery := &savedIdentityRecovery{}
+	recoverIdentity := func(recoveryCtx context.Context, cause error) (maintainedLogin, []appleservices.AccountDevice, error) {
+		if !*reauthenticateSavedSession {
+			return nil, nil, cause
+		}
+		return identityRecovery.recover(recoveryCtx, cause, accountID, savedIdentityRecoveryDependencies{
+			accepted: store.LoadAcceptedICloud,
+			password: func() (string, error) { return credentialvault.Load(*dir, appleID) },
+			begin: func(accepted appleservices.RestoredICloudSession, savedPassword string) (recoveredIdentityLogin, error) {
+				return appleservices.ReauthenticateRestoredLogin(appleID, savedPassword, store, accepted, options...)
+			},
+			now: time.Now,
+		})
+	}
 	circles := newCircleManager(accountID, client.DSID)
 	if ctx.Err() != nil {
 		return nil
 	}
 	fmt.Println("Apple accepted the registration request. Waiting for real AuthKit delivery; trusted-device reception is not yet verified.")
+	startupIdentityRecovered := false
 	devices, err := active.AccountDevices()
+	if err != nil && deviceIdentityNeedsRecovery(err) && *reauthenticateSavedSession {
+		fmt.Fprintln(os.Stderr, "Saved device identity was rejected; attempting one account-bound credential renewal.")
+		renewed, recoveredDevices, recoveryErr := recoverIdentity(ctx, err)
+		if recoveryErr == nil {
+			active, devices, err = renewed, recoveredDevices, nil
+			startupIdentityRecovered = true
+			fmt.Fprintln(os.Stderr, "Account identity and iCloud quota renewal verified.")
+		} else {
+			err = recoveryErr
+			fmt.Fprintln(os.Stderr, "Saved identity renewal did not complete; existing account state was retained.")
+		}
+	}
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -475,8 +503,10 @@ func run() (runErr error) {
 			}
 		}
 	}
-	if err := active.SaveSession(); err != nil {
-		return err
+	if err == nil && !startupIdentityRecovered {
+		if saveErr := active.SaveSession(); saveErr != nil {
+			return saveErr
+		}
 	}
 	if err := saveCredentialAfterSuccessfulLogin(*dir, appleID, password, *resumeSession); err != nil {
 		fmt.Fprintln(os.Stderr, "Credential vault save failed; the authenticated login remains active:", err)
@@ -484,6 +514,12 @@ func run() (runErr error) {
 	status.Authenticated, status.State = true, "online"
 	if err != nil {
 		status.State = "device_query_failed"
+		if deviceIdentityNeedsRecovery(err) || errors.Is(err, errSavedIdentityRecoveryUnavailable) {
+			status.State = "device_identity_refresh_required"
+		}
+		if errors.Is(err, errVerificationRequired) {
+			status.State, status.VerificationRequired = "verification_required", true
+		}
 	}
 	status.LastRefreshAt = time.Now().UTC()
 	if panel != nil {
@@ -560,6 +596,9 @@ func run() (runErr error) {
 	}
 	renew := func() control.Result {
 		renewed, devices, err := renewSessionMode(beginRenewal, accountID, registration, false)
+		if err != nil && deviceIdentityNeedsRecovery(err) && *reauthenticateSavedSession {
+			renewed, devices, err = recoverIdentity(ctx, err)
+		}
 		if err != nil {
 			status.State = "refresh_failed"
 			if errors.Is(err, errVerificationRequired) {
