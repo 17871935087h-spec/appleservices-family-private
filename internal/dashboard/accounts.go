@@ -1,9 +1,13 @@
 package dashboard
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -52,7 +56,19 @@ type AccountView struct {
 
 // registry is the on-disk account list.
 type registry struct {
-	Accounts []*registryEntry `json:"accounts"`
+	Accounts         []*registryEntry       `json:"accounts"`
+	DeletionSequence int64                  `json:"deletion_sequence,omitempty"`
+	DeletionEvents   []accountDeletionEvent `json:"deletion_events,omitempty"`
+}
+
+const maxRegistryBytes = 64 << 20
+
+// accountDeletionEvent is a durable, redacted record of an account removed
+// from the Windows account registry. It deliberately contains no Apple ID.
+type accountDeletionEvent struct {
+	Sequence      int64  `json:"sequence"`
+	AccountID     string `json:"account_id"`
+	AppleIDSHA256 string `json:"apple_id_sha256"`
 }
 
 type registryEntry struct {
@@ -72,12 +88,8 @@ func accountsDir(root string) string  { return filepath.Join(root, "accounts") }
 // state directory into the first account the first time it runs, so an existing
 // login is preserved rather than abandoned.
 func loadRegistry(root, legacyDir string) ([]*registryEntry, error) {
-	data, err := os.ReadFile(registryPath(root))
+	reg, err := readRegistryDocument(root)
 	if err == nil {
-		var reg registry
-		if json.Unmarshal(data, &reg) != nil {
-			return nil, errors.New("账号列表文件损坏，请修复或删除 accounts.json")
-		}
 		valid := reg.Accounts[:0]
 		for _, entry := range reg.Accounts {
 			if entry == nil || !idPattern.MatchString(entry.ID) {
@@ -170,20 +182,128 @@ func legacyIdentity(dir string) (name, appleID string) {
 	return strings.SplitN(session.AppleID, "@", 2)[0], session.AppleID
 }
 
+func readRegistryDocument(root string) (registry, error) {
+	var reg registry
+	file, err := os.Open(registryPath(root))
+	if err != nil {
+		return reg, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maxRegistryBytes {
+		return registry{}, errors.New("账号列表文件损坏，请修复或删除 accounts.json")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxRegistryBytes+1))
+	if err != nil || len(data) > maxRegistryBytes || json.Unmarshal(data, &reg) != nil || validateDeletionEvents(reg) != nil {
+		return registry{}, errors.New("账号列表文件损坏，请修复或删除 accounts.json")
+	}
+	return reg, nil
+}
+
+func validateDeletionEvents(reg registry) error {
+	if reg.DeletionSequence < 0 || int64(len(reg.DeletionEvents)) != reg.DeletionSequence {
+		return errors.New("invalid account deletion ledger")
+	}
+	for index, event := range reg.DeletionEvents {
+		if event.Sequence != int64(index+1) || !idPattern.MatchString(event.AccountID) || !validSHA256Hex(event.AppleIDSHA256) {
+			return errors.New("invalid account deletion ledger")
+		}
+	}
+	return nil
+}
+
+func validSHA256Hex(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size && value == strings.ToLower(value)
+}
+
 func saveRegistry(root string, accounts []*registryEntry) error {
-	reg := registry{Accounts: accounts}
+	reg, err := readRegistryDocument(root)
+	if os.IsNotExist(err) {
+		reg = registry{}
+	} else if err != nil {
+		return err
+	}
+	reg.Accounts = accounts
+	return writeRegistryDocument(root, reg)
+}
+
+func saveRegistryWithDeletion(root string, accounts []*registryEntry, deleted *registryEntry) (accountDeletionEvent, error) {
+	var empty accountDeletionEvent
+	if deleted == nil || !idPattern.MatchString(deleted.ID) {
+		return empty, errors.New("invalid deleted account")
+	}
+	reg, err := readRegistryDocument(root)
+	if os.IsNotExist(err) {
+		reg = registry{}
+	} else if err != nil {
+		return empty, err
+	}
+	if reg.DeletionSequence == math.MaxInt64 {
+		return empty, errors.New("account deletion sequence exhausted")
+	}
+	normalizedAppleID := strings.ToLower(strings.TrimSpace(deleted.AppleID))
+	appleIDHash := sha256.Sum256([]byte(normalizedAppleID))
+	event := accountDeletionEvent{
+		Sequence: reg.DeletionSequence + 1, AccountID: deleted.ID,
+		AppleIDSHA256: hex.EncodeToString(appleIDHash[:]),
+	}
+	reg.Accounts = accounts
+	reg.DeletionSequence = event.Sequence
+	reg.DeletionEvents = append(reg.DeletionEvents, event)
+	if err := writeRegistryDocument(root, reg); err != nil {
+		return empty, err
+	}
+	return event, nil
+}
+
+func writeRegistryDocument(root string, reg registry) error {
+	if err := validateDeletionEvents(reg); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(reg, "", "  ")
 	if err != nil {
 		return err
+	}
+	if len(data) > maxRegistryBytes {
+		return errors.New("账号列表文件超过大小限制")
 	}
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return err
 	}
 	temp := registryPath(root) + ".tmp"
-	if err := os.WriteFile(temp, data, 0600); err != nil {
+	file, err := os.OpenFile(temp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(temp, registryPath(root))
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(temp)
+		}
+	}()
+	n, writeErr := file.Write(data)
+	if writeErr == nil && n != len(data) {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr == nil {
+		writeErr = file.Sync()
+	}
+	closeErr := file.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err := os.Rename(temp, registryPath(root)); err != nil {
+		return err
+	}
+	renamed = true
+	return nil
 }
 
 // newAccountDir allocates a fresh state directory. It never reuses an existing

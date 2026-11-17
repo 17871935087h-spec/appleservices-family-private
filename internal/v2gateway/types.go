@@ -15,7 +15,7 @@ const (
 	DefaultDashboard          = "http://127.0.0.1:18741"
 	maxRequestBytes           = 4096
 	maxCredentialRequestBytes = 16 << 10
-	maxRegistryBytes          = 256 << 10
+	maxRegistryBytes          = 64 << 20
 	maxResponseBytes          = 1 << 20
 	maxFamilyRosterMembers    = 20
 )
@@ -159,7 +159,15 @@ type accountEntry struct {
 }
 
 type accountRegistry struct {
-	Accounts []accountEntry `json:"accounts"`
+	Accounts         []accountEntry         `json:"accounts"`
+	DeletionSequence int64                  `json:"deletion_sequence,omitempty"`
+	DeletionEvents   []accountDeletionEvent `json:"deletion_events,omitempty"`
+}
+
+type accountDeletionEvent struct {
+	Sequence      int64  `json:"sequence"`
+	AccountID     string `json:"account_id"`
+	AppleIDSHA256 string `json:"apple_id_sha256"`
 }
 
 type accountListRequest struct{}

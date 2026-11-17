@@ -171,6 +171,14 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, errorReply{OK: false, Stage: "request_rejected", Message: "请求被拒绝"})
 		return
 	}
+	if r.URL.Path == "/v1/accounts/deletions" {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, errorReply{OK: false, Stage: "method_not_allowed", Message: "请求方法不受支持"})
+			return
+		}
+		g.handleAccountDeletions(w, r)
+		return
+	}
 	if r.Method != http.MethodPost || r.URL.RawQuery != "" {
 		writeJSON(w, http.StatusMethodNotAllowed, errorReply{OK: false, Stage: "method_not_allowed", Message: "请求方法不受支持"})
 		return

@@ -2,6 +2,8 @@ package v2gateway
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -38,7 +40,7 @@ func loadRegistry(path string) (accountRegistry, error) {
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&result) != nil || decoder.Decode(&struct{}{}) != io.EOF || len(result.Accounts) > 500 {
+	if decoder.Decode(&result) != nil || decoder.Decode(&struct{}{}) != io.EOF || len(result.Accounts) > 500 || validateDeletionEvents(result) != nil {
 		return accountRegistry{}, errors.New("account registry is invalid")
 	}
 	seenIDs := make(map[string]struct{}, len(result.Accounts))
@@ -55,6 +57,26 @@ func loadRegistry(path string) (accountRegistry, error) {
 		}
 	}
 	return result, nil
+}
+
+func validateDeletionEvents(registry accountRegistry) error {
+	if registry.DeletionSequence < 0 || int64(len(registry.DeletionEvents)) != registry.DeletionSequence {
+		return errAccountListInvalid
+	}
+	for index, event := range registry.DeletionEvents {
+		if event.Sequence != int64(index+1) || !validAccountID(event.AccountID) || !validSHA256Hex(event.AppleIDSHA256) {
+			return errAccountListInvalid
+		}
+	}
+	return nil
+}
+
+func validSHA256Hex(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size && value == strings.ToLower(value)
 }
 
 func accountListFromRegistry(registry accountRegistry) ([]accountListEntry, error) {

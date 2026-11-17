@@ -316,7 +316,9 @@ func (s *Server) removeAccount(ctx context.Context, id string) control.Result {
 		remaining = append(remaining, &registryEntry{ID: account.ID, Name: account.Name, AppleID: account.AppleID, Dir: account.Dir, CreatedAt: account.CreatedAt})
 		accounts = append(accounts, account)
 	}
-	if err := saveRegistry(s.config.Dir, remaining); err != nil {
+	if _, err := saveRegistryWithDeletion(s.config.Dir, remaining, &registryEntry{
+		ID: target.ID, AppleID: target.AppleID,
+	}); err != nil {
 		return control.Result{Message: "无法保存账号列表"}
 	}
 	s.accounts = accounts
